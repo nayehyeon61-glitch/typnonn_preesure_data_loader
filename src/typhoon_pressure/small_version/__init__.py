@@ -9,7 +9,7 @@ from .config import (
 )
 from .dataset import DualTargetDataset, SpatialDistributionLookup, WeatherNextDualTargetDataset
 from .losses import DualObjectiveLoss
-from .model import SmallDualScaleModel, WeatherNextFusionTransformer
+from .model import GPTForecastRouter, SmallDualScaleModel, WeatherNextFusionTransformer
 from .weathernext_bridge import (
     DirectoryForecastTokenStore,
     ForecastTokens,
@@ -25,6 +25,7 @@ __all__ = [
     "DirectoryForecastTokenStore",
     "EastAsiaBounds",
     "ForecastTokens",
+    "GPTForecastRouter",
     "SmallDualScaleModel",
     "SmallModelConfig",
     "SpatialDistributionLookup",

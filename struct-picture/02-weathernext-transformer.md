@@ -1,99 +1,96 @@
 # 02. WeatherNext Output to GPT-routed Transformer Input
 
+이 그림은 mask가 적용되는 정확한 순서와 Router의 실제 입력 의존성을 보여줍니다.
+
 ```mermaid
 flowchart TB
-    IB["IBTrACS storm state"]
-    ATM["HRES / ERA5 atmosphere"]
-    BUILDER["InitialConditionBuilder<br/>시간·좌표·변수 정렬"]
-    RES["WeatherNext Resolver<br/>fine-tuned → pretrained → download → API"]
-    WN["WeatherNext 2 frozen inference<br/>0–15일 forecast"]
-    XR["xarray<br/>lead × lat × lon × variable"]
+    INIT["Aligned initial condition"]
+    RES["Priority resolver"]
+    WN["Resolved WeatherNext inference<br/>0–15 days, frozen downstream"]
+    XR["xarray forecast<br/>lead × lat × lon × variable"]
 
-    IB --> BUILDER
-    ATM --> BUILDER
-    BUILDER --> RES
+    INIT --> RES
     RES --> WN
     WN --> XR
 
-    subgraph TOKENIZE["Tokenization"]
-        direction TB
-        LEAD["10 selected lead times"]
+    subgraph TOK["Tokenization"]
+        SELECT["Up to 10 lead times"]
         PATCH["6×12 spatial patches"]
-        TOKEN["최대 720 tokens<br/>values B×N×V"]
-        POS["Position features B×N×6<br/>lead·lat·lon encoding"]
+        VALUES["Raw token values<br/>B×N×V, N≤720"]
+        POS["Position features<br/>B×N×6"]
+        SOURCE_MASKS["Source feature and token masks"]
     end
 
-    XR --> LEAD
-    LEAD --> PATCH
-    PATCH --> TOKEN
+    XR --> SELECT
+    SELECT --> PATCH
+    PATCH --> VALUES
     PATCH --> POS
+    PATCH --> SOURCE_MASKS
 
-    subgraph MASKS["Input masks"]
-        direction TB
-        FEATURE["Feature mask<br/>변수별 NaN 차단"]
-        TOKENMASK["Token mask<br/>전체 변수 결측 token 차단"]
-        PAD["Padding mask"]
-        RANDOM["Random valid-feature mask<br/>training p=0.15"]
+    subgraph MASKING["Runtime masking before projection"]
+        RANDOM["Random feature keep mask<br/>training only, p=0.15 masked"]
+        EFFECTIVE_FEATURE["Effective feature mask<br/>source feature ∧ random keep"]
+        ZERO["Masked values set to zero"]
+        EFFECTIVE_TOKEN["Effective token mask<br/>source token ∧ any valid feature"]
+        PADDING["Transformer padding mask<br/>CLS is always valid"]
     end
 
-    TOKEN --> FEATURE
-    FEATURE --> TOKENMASK
-    TOKENMASK --> PAD
-    PAD --> RANDOM
+    SOURCE_MASKS --> EFFECTIVE_FEATURE
+    RANDOM --> EFFECTIVE_FEATURE
+    VALUES --> ZERO
+    EFFECTIVE_FEATURE --> ZERO
+    SOURCE_MASKS --> EFFECTIVE_TOKEN
+    EFFECTIVE_FEATURE --> EFFECTIVE_TOKEN
+    EFFECTIVE_TOKEN --> PADDING
 
-    PROJ["Forecast projection<br/>value + feature mask + position<br/>→ Z_WN"]
-    TOKEN --> PROJ
-    FEATURE --> PROJ
+    PROJ["Forecast projection<br/>zeroed values + effective feature mask + position<br/>→ Z_WN"]
+    ZERO --> PROJ
+    EFFECTIVE_FEATURE --> PROJ
     POS --> PROJ
 
-    GPT["GPT semantic state z_GPT<br/>10D + state mask"]
-
     subgraph ROUTER["GPTForecastRouter"]
-        direction TB
-        CTX["GPT context projection"]
-        TG["Token Gate<br/>g_token ∈ R^(B×N×1)"]
-        CG["Channel Gate<br/>g_channel ∈ R^(B×1×d)"]
+        GPT["GPT state values + mask"]
+        CTX["Masked-state context MLP"]
+        TG["Token gate<br/>from Z_WN + context"]
+        CG["Channel gate<br/>from context only"]
         ROUTE["Z̃_WN = Z_WN ⊙ g_token ⊙ g_channel"]
-        ID["GPT missing → gate = 1<br/>exact identity"]
+        ID["No GPT field available<br/>both gates forced to 1"]
     end
 
     GPT --> CTX
+    PROJ --> TG
     CTX --> TG
     CTX --> CG
-    PROJ --> TG
     PROJ --> ROUTE
     TG --> ROUTE
     CG --> ROUTE
-    GPT -. "mask=0" .-> ID
+    GPT -. "all-zero state mask" .-> ID
     ID --> ROUTE
 
-    subgraph ENCODER["Trainable WeatherNext representation"]
-        direction TB
-        CLS["Always-valid CLS token"]
-        TF["Non-causal Transformer Encoder"]
-        MEMORY["GPT-routed WeatherNext memory"]
-        GLOBAL["CLS global representation"]
+    subgraph ENCODER["Forecast representation"]
+        CLS["Prepend always-valid CLS"]
+        TF["Non-causal Transformer encoder"]
+        MEMORY["Routed WeatherNext memory"]
+        GLOBAL["CLS global state"]
     end
 
     ROUTE --> CLS
     CLS --> TF
-    RANDOM --> TF
+    PADDING --> TF
     TF --> MEMORY
     TF --> GLOBAL
 ```
 
-## Router 수식
-
 ```math
-g_{token}=2\sigma(f_{token}(Z_{WN},z_{GPT}))
+g_{token}=2\sigma\!\left(f_{token}(Z_{WN}+f_{ctx}(z_{GPT},m_{GPT}))\right)
 ```
 
 ```math
-g_{channel}=2\sigma(f_{channel}(z_{GPT}))
+g_{channel}=2\sigma\!\left(f_{channel}(f_{ctx}(z_{GPT},m_{GPT}))\right)
 ```
 
 ```math
 \tilde Z_{WN}=Z_{WN}\odot g_{token}\odot g_{channel}
 ```
 
-마지막 gate layer는 0으로 초기화하므로 학습 시작 시 `2σ(0)=1`입니다. 즉 기존 Transformer와 동일한 입력으로 시작하고, 학습을 통해 GPT state가 spatial/lead-time token 및 latent channel의 중요도를 점진적으로 조절합니다.
+마지막 gate layer의 weight와 bias는 0으로 초기화되어 첫 forward는 `2σ(0)=1`입니다. Random mask는 Router 뒤가 아니라 projection 전에 적용되고, padding mask는 Router가 아니라 Transformer attention에 적용됩니다.

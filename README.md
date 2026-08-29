@@ -389,7 +389,7 @@ Transformer 입력에는 변수별 결측 mask, token attention mask, history ma
 
 ### GPT API state feature
 
-태풍·주변 고기압 history의 제한된 수치 요약을 OpenAI Responses API Structured Outputs에 전달해 10차원 synoptic state를 추출할 수 있습니다. GPT는 학습 중 호출하지 않고 결과를 사전에 cache합니다. Cached state는 history representation을 FiLM 방식으로 조절해 `dynamic history`를 만든 뒤 GRU에 전달됩니다.
+태풍·주변 고기압 history의 제한된 수치 요약을 OpenAI Responses API Structured Outputs에 전달해 10차원 synoptic state를 추출할 수 있습니다. GPT는 학습 중 호출하지 않고 결과를 사전에 cache합니다. Cached state는 history representation을 FiLM 방식으로 조절하는 동시에 WeatherNext token/channel gate를 제어합니다.
 
 ```bash
 pip install -e '.[io,small,gpt]'
@@ -407,7 +407,7 @@ train-weathernext-transformer \
   --gpt-state-dir data/gpt_states
 ```
 
-API 실패나 state cache 누락은 임의 값으로 대체하지 않습니다. 10차원 값과 mask를 모두 0으로 두어 GPT branch가 fusion에 기여하지 않도록 합니다.
+API 실패나 state cache 누락은 임의 값으로 대체하지 않습니다. 10차원 값과 mask를 모두 0으로 두어 FiLM은 `γ=β=0`, Router는 `g_token=g_channel=1`인 exact identity fallback을 사용합니다. `--gpt-state-dir`을 생략하면 GPT adapter module 자체가 생성되지 않습니다.
 
 자세한 데이터 계약과 설계 근거는 [`small_version/README.md`](src/typhoon_pressure/small_version/README.md)에 정리했습니다.
 

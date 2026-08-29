@@ -7,6 +7,7 @@ from typhoon_pressure.dataset import TyphoonPressureDataset
 from typhoon_pressure.small_version import (
     DirectoryForecastTokenStore,
     DualObjectiveLoss,
+    GPTForecastRouter,
     SmallModelConfig,
     SpatialDistributionLookup,
     TransformerConfig,
@@ -97,6 +98,7 @@ def test_weathernext_output_reaches_masked_transformer(tmp_path):
         batch["forecast_positions"], gpt_values, gpt_mask,
     )
     assert torch.isfinite(masked_outputs["distribution_logits"]).all()
+    assert masked_outputs["gpt_forecast_token_gate_mean"].item() == 1.0
 
     conditioned_outputs = model(
         batch["history"], batch["history_mask"], batch["forecast_values"],
@@ -118,3 +120,38 @@ def test_weathernext_output_reaches_masked_transformer(tmp_path):
     assert not torch.allclose(
         conditioned_outputs["distribution_logits"], unconditioned_outputs["distribution_logits"]
     )
+
+
+def test_gpt_forecast_router_is_identity_then_learns_nonuniform_gates():
+    torch.manual_seed(11)
+    router = GPTForecastRouter(gpt_state_dim=3, model_dim=8)
+    tokens = torch.randn(2, 5, 8)
+    state = torch.randn(2, 3)
+    present = torch.ones_like(state)
+
+    routed, token_gate, channel_gate, available = router(tokens, state, present)
+    assert torch.allclose(routed, tokens)
+    assert torch.allclose(token_gate, torch.ones_like(token_gate))
+    assert torch.allclose(channel_gate, torch.ones_like(channel_gate))
+    assert torch.all(available == 1)
+
+    optimizer = torch.optim.SGD(router.parameters(), lr=0.1)
+    routed.square().mean().backward()
+    assert router.token_gate[-1].weight.grad is not None
+    assert torch.count_nonzero(router.token_gate[-1].weight.grad) > 0
+    assert router.channel_gate.weight.grad is not None
+    assert torch.count_nonzero(router.channel_gate.weight.grad) > 0
+    optimizer.step()
+
+    _, learned_token_gate, learned_channel_gate, _ = router(tokens, state, present)
+    assert not torch.allclose(learned_token_gate, torch.ones_like(learned_token_gate))
+    assert not torch.allclose(learned_channel_gate, torch.ones_like(learned_channel_gate))
+
+    missing = torch.zeros_like(present)
+    missing_routed, missing_token_gate, missing_channel_gate, available = router(
+        tokens, state, missing
+    )
+    assert torch.allclose(missing_routed, tokens)
+    assert torch.allclose(missing_token_gate, torch.ones_like(missing_token_gate))
+    assert torch.allclose(missing_channel_gate, torch.ones_like(missing_channel_gate))
+    assert torch.all(available == 0)

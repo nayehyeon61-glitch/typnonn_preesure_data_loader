@@ -1,145 +1,127 @@
 # 01. Overall System
 
-현재 시스템은 WeatherNext 2의 물리적 forecast dynamics를 고정하고, GPT가 생성한 synoptic state를 두 경로에서 능동적으로 사용합니다.
-
-1. History FiLM conditioning
-2. WeatherNext Token / Channel Router
+아래 구조는 `feature/weathernext-resolver`의 실제 실행 경로를 기준으로 합니다. WeatherNext와 GPT API는 downstream 학습 밖에서 실행되고, cache/token을 입력받는 FiLM·Router·GRU·Transformer·두 예측 head만 공동 학습됩니다.
 
 ```mermaid
 flowchart TB
-    subgraph SOURCE["1. 원천 데이터"]
-        direction LR
-        IB["IBTrACS<br/>위치·풍속·기압·시간"]
-        ERA["HRES / ERA5<br/>대기장·초기조건"]
-        OBS["관측 정답<br/>미래 위치·경로"]
+    subgraph SOURCE["1. Source and targets"]
+        IB["IBTrACS<br/>track, wind, pressure, time"]
+        ATM["HRES or ERA5<br/>atmospheric initial state"]
+        DISTDATA["typnoon-disribution<br/>monthly Earth distribution"]
+        DISTGT["Day 15–30 soft grid target<br/>B×16×2592"]
+        TRACKGT["East Asia track target<br/>valid and region mask"]
     end
 
-    subgraph TARGETS["2. 전처리와 target 생성"]
-        direction LR
-        INIT["InitialConditionBuilder<br/>절대시간·공간 정렬"]
-        DS["typnoon-disribution<br/>Earth distribution"]
-        GT["15–30일 soft grid target<br/>36×72 cells"]
-        TT["동아시아 track target<br/>valid + region mask"]
+    IB --> DISTDATA
+    DISTDATA --> DISTGT
+    IB --> TRACKGT
+
+    subgraph OFFLINE["2. Offline or upstream inference"]
+        INIT["InitialConditionBuilder<br/>absolute-time and grid alignment"]
+        RES["WeatherNext Resolver<br/>fine-tuned → local official → download → API"]
+        ROLLOUT["Resolved WeatherNext rollout<br/>0–15 days"]
+        TOKENIZE["Spatiotemporal tokenizer<br/>values, masks, positions"]
+        SUMMARY["Deterministic history summary"]
+        GPTAPI["GPT Structured Output API"]
+        CACHE["10D semantic-state cache<br/>values and state mask"]
     end
 
     IB --> INIT
-    ERA --> INIT
-    IB --> DS
-    OBS --> DS
-    DS --> GT
-    OBS --> TT
-
-    subgraph WNB["3-A. Frozen WeatherNext dynamics"]
-        direction TB
-        RES["WeatherNext Resolver<br/>fine-tuned → pretrained → download → API"]
-        WN["WeatherNext 2<br/>Frozen rollout 0–15일"]
-        TOK["Spatiotemporal tokenizer<br/>최대 720 tokens"]
-        FP["Value + mask + position projection"]
-        ROUTED["GPT-routed WeatherNext tokens"]
-        TE["Masked Transformer Encoder"]
-        MEM["WeatherNext memory + CLS"]
-    end
-
+    ATM --> INIT
     INIT --> RES
-    RES --> WN
-    WN --> TOK
-    TOK --> FP
+    RES --> ROLLOUT
+    ROLLOUT --> TOKENIZE
+    IB --> SUMMARY
+    ATM --> SUMMARY
+    SUMMARY --> GPTAPI
+    GPTAPI --> CACHE
 
-    subgraph GPTB["3-B. GPT semantic-state branch"]
-        direction TB
-        HIS["태풍·기압 History<br/>48시간"]
-        SUM["Deterministic Summary"]
-        API["GPT Structured Output<br/>10-state cache"]
-        ZGPT["Semantic State z_GPT<br/>steering·recurvature·risk·uncertainty"]
+    subgraph HISTORY["3-A. History branch"]
+        HP["Masked history projection<br/>concat values and mask"]
+        FILM["History FiLM<br/>γ, β from GPT state"]
+        DYNAMIC["Dynamic history<br/>h'=(1+γ)h+β"]
+        GRU["GRU history encoder"]
+        HH["History hidden state"]
     end
 
-    IB --> HIS
-    ERA --> HIS
-    HIS --> SUM
-    SUM --> API
-    API --> ZGPT
-
-    subgraph ACTIVE["3-C. Active LLM control"]
-        direction LR
-        FILM["History FiLM<br/>γ, β"]
-        TGR["Token Gate<br/>g_token"]
-        CGR["Channel Gate<br/>g_channel"]
-    end
-
-    ZGPT --> FILM
-    ZGPT --> TGR
-    ZGPT --> CGR
-    HIS --> FILM
-
-    subgraph HISTORY["History dynamics representation"]
-        direction TB
-        DH["GPT-conditioned history<br/>h'=(1+γ)h+β"]
-        GRU["Masked GRU Encoder"]
-        HH["Typhoon hidden state"]
-    end
-
-    FILM --> DH
-    HIS --> DH
-    DH --> GRU
+    IB --> HP
+    ATM --> HP
+    CACHE --> FILM
+    HP --> DYNAMIC
+    FILM --> DYNAMIC
+    DYNAMIC --> GRU
     GRU --> HH
 
-    FP --> TGR
-    FP --> CGR
-    TGR --> ROUTED
-    CGR --> ROUTED
-    ROUTED --> TE
-    TE --> MEM
-
-    subgraph MODEL["4. 공유 표현과 예측"]
-        direction TB
-        FUS["Fusion<br/>WeatherNext CLS + GRU hidden"]
-        Q["16 learned future queries<br/>day 15…30"]
-        DEC["Cross-attention Decoder"]
-        GRID["Earth-grid logits<br/>B×16×2592"]
-        TH["East Asia Track Head"]
-        TP["Track prediction<br/>B×20×2"]
+    subgraph FORECAST["3-B. WeatherNext branch"]
+        MASK["Training random feature mask<br/>plus missing-data masks"]
+        PROJ["Value + effective mask + position<br/>projection to Z_WN"]
+        CONTEXT["GPT context MLP"]
+        TG["Token Gate<br/>from Z_WN + GPT context"]
+        CG["Channel Gate<br/>from GPT context only"]
+        ROUTED["Routed tokens<br/>Z̃_WN=Z_WN⊙g_token⊙g_channel"]
+        TF["Transformer encoder<br/>padding mask + always-valid CLS"]
+        MEM["Routed forecast memory and CLS"]
     end
 
-    MEM --> FUS
-    HH --> FUS
-    Q --> DEC
-    MEM --> DEC
-    FUS --> DEC
-    DEC --> GRID
-    FUS --> TH
-    TH --> TP
+    TOKENIZE --> MASK
+    MASK --> PROJ
+    CACHE --> CONTEXT
+    PROJ --> TG
+    CONTEXT --> TG
+    CONTEXT --> CG
+    PROJ --> ROUTED
+    TG --> ROUTED
+    CG --> ROUTED
+    ROUTED --> TF
+    MASK --> TF
+    TF --> MEM
 
-    subgraph OBJECTIVE["5. Dual objective"]
-        direction LR
-        CE["Soft Distribution CE<br/>day mask"]
-        MSE["Track MSE in km<br/>valid + region mask"]
-        TOTAL["λ_dist L_CE<br/>+ λ_track L_MSE"]
+    subgraph OUTPUT["4. Prediction"]
+        FUS["Fusion<br/>history hidden + forecast CLS"]
+        QUERY["16 learned day queries<br/>day 15…30"]
+        DEC["Cross-attention decoder<br/>queries attend forecast memory"]
+        GRID["Global distribution logits"]
+        TRACK["East Asia track head"]
+        LATLON["Track latitude and longitude"]
+    end
+
+    HH --> FUS
+    MEM --> FUS
+    FUS --> QUERY
+    QUERY --> DEC
+    MEM --> DEC
+    DEC --> GRID
+    FUS --> TRACK
+    TRACK --> LATLON
+
+    subgraph LOSS["5. Joint objective"]
+        CE["Soft-label distribution CE<br/>available-day mask"]
+        MSE["Normalized track MSE in km<br/>valid and East-Asia mask"]
+        TOTAL["L_total = λ_dist L_CE + λ_track L_MSE"]
     end
 
     GRID --> CE
-    GT --> CE
-    TP --> MSE
-    TT --> MSE
+    DISTGT --> CE
+    LATLON --> MSE
+    TRACKGT --> MSE
     CE --> TOTAL
     MSE --> TOTAL
 
-    TOTAL -. "gradient" .-> DEC
-    TOTAL -. "gradient" .-> TH
-    TOTAL -. "shared gradient" .-> FUS
-    TOTAL -. "shared gradient" .-> TE
-    TOTAL -. "router gradient" .-> TGR
-    TOTAL -. "router gradient" .-> CGR
-    TOTAL -. "shared gradient" .-> GRU
+    TOTAL -. "through both heads" .-> FUS
+    TOTAL -. "shared gradient" .-> TF
+    TOTAL -. "router gradient" .-> TG
+    TOTAL -. "router gradient" .-> CG
+    TOTAL -. "history gradient" .-> GRU
     TOTAL -. "FiLM gradient" .-> FILM
 ```
 
-## 핵심 해석
+## 학습 경계
 
-```text
-WeatherNext 2 = frozen physical forecast dynamics
-GPT state     = semantic state
-GPT Router    = semantic state → routing policy
-Transformer   = routed WeatherNext representation learner
-```
+| 구성요소 | downstream 학습 상태 | 비고 |
+|---|---:|---|
+| Resolved WeatherNext rollout | 고정 | fine-tuned checkpoint도 이 단계에서는 inference-only |
+| GPT API와 state cache | 고정 | 학습 loop에서 API를 호출하지 않음 |
+| FiLM, GPTForecastRouter | 학습 | 두 loss의 gradient를 받음 |
+| GRU, Transformer, Fusion, Decoder, Heads | 학습 | 공동 최적화 |
 
-WeatherNext 2와 GPT API 자체에는 학습 gradient가 전달되지 않습니다. 반면 GPT state를 입력받는 FiLM adapter와 Token/Channel Router는 후단 loss에서 학습됩니다.
+GPT cache가 누락되거나 masked이면 FiLM은 `γ=β=0`, Router는 `g_token=g_channel=1`이 되어 두 경로 모두 정확한 identity fallback을 사용합니다.

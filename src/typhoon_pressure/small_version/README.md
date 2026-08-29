@@ -7,13 +7,13 @@ typnoon-disribution
   spatial_distribution.csv (IBTrACS monthly Earth-grid probabilities)
                               |
                               v
-WeatherNext 0-15 day xarray --> masked spatiotemporal tokens
-                                          |
-Pressure Data Loader history --> GPT Structured Output
-                                  |
-                         GPT-conditioned dynamic history
-                                  |
-                              GRU encoder + Transformer fusion
+WeatherNext 0-15 day xarray --> masked tokens --> GPT Router --> Transformer
+                                                       |
+Pressure Data Loader history --> GPT Structured Output cache
+              |                        |
+              +--> masked projection --> History FiLM --> GRU
+                                                       |
+                                      GRU + Transformer fusion
                                           |              |
                                           v              v
                          15-30 day future queries     East Asia track
@@ -67,13 +67,14 @@ track / intensity uncertainty
 state confidence
 ```
 
-GPT에는 태풍·주변 고기압 history의 최신값·변화량·유효 비율만 전달합니다. OpenAI Responses API Structured Outputs로 schema를 강제한 뒤 결과를 sample별로 한 번만 cache합니다. 이 state는 FiLM 형태의 scale/shift로 history representation을 동적으로 조절한 다음 GRU에 전달됩니다.
+GPT에는 태풍·주변 고기압 history의 최신값·변화량·유효 비율만 전달합니다. OpenAI Responses API Structured Outputs로 schema를 강제한 뒤 결과를 sample별로 한 번만 cache합니다. 같은 state가 FiLM의 scale/shift로 history representation을 조절하고, `GPTForecastRouter`의 token/channel gate로 WeatherNext representation을 routing합니다.
 
 ```text
 raw history → masked projection → GPT scale/shift → dynamic history → GRU
+WeatherNext token → GPT token/channel gates → routed token → Transformer
 ```
 
-API 실패·거절·미생성 state는 `values=0, mask=0`으로 저장됩니다. 이 경우 scale과 shift가 정확히 0이 되어 기존 history가 변경되지 않는 identity 경로로 작동합니다.
+API 실패·거절·미생성 state는 `values=0, mask=0`으로 저장됩니다. 이 경우 scale과 shift는 0, 두 Router gate는 1이 되어 history와 WeatherNext token 모두 exact identity 경로로 작동합니다. `--gpt-state-dir` 자체를 생략하면 두 GPT adapter module은 생성되지 않습니다.
 
 ```bash
 pip install -e '.[io,small,gpt]'

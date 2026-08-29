@@ -292,7 +292,12 @@ class WeatherNextFusionTransformer(nn.Module):
         if router_token_gate is not None and router_channel_gate is not None:
             valid = effective_token_mask.to(router_token_gate.dtype)
             token_gate_values = router_token_gate.squeeze(-1)
-            token_gate_mean = (token_gate_values * valid).sum() / valid.sum().clamp_min(1.0)
+            valid_count = valid.sum()
+            token_gate_mean = torch.where(
+                valid_count > 0,
+                (token_gate_values * valid).sum() / valid_count.clamp_min(1.0),
+                torch.ones((), dtype=token_gate_values.dtype, device=token_gate_values.device),
+            )
             result.update(
                 {
                     "gpt_forecast_router_active_fraction": router_active_fraction,
