@@ -15,6 +15,12 @@ from .weathernext_backends import (
     build_weathernext_runner,
 )
 from .weathernext_official import OfficialWeatherNextRunner
+from .weathernext_resolver import (
+    CheckpointOrigin,
+    ResolvedWeatherNext,
+    WeatherNextSelectionConfig,
+    resolve_weathernext,
+)
 
 __all__ = [
     "HighPressureConfig",
@@ -29,6 +35,10 @@ __all__ = [
     "build_weathernext_runner",
     "WeatherNextBackendConfig",
     "WeatherNextBackend",
+    "CheckpointOrigin",
+    "ResolvedWeatherNext",
+    "WeatherNextSelectionConfig",
+    "resolve_weathernext",
     "build_integrated_dataset",
     "extract_surrounding_highs",
     "load_ibtracs",
