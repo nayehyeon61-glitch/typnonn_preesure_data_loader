@@ -9,6 +9,11 @@ from .initial_condition import (
 )
 from .merge import build_integrated_dataset
 from .weathernext_adapter import WeatherNextRequest, make_weathernext_request
+from .weathernext_backends import (
+    WeatherNextBackend,
+    WeatherNextBackendConfig,
+    build_weathernext_runner,
+)
 
 __all__ = [
     "HighPressureConfig",
@@ -19,6 +24,9 @@ __all__ = [
     "TyphoonPressureDataset",
     "WeatherInitialCondition",
     "WeatherNextRequest",
+    "build_weathernext_runner",
+    "WeatherNextBackendConfig",
+    "WeatherNextBackend",
     "build_integrated_dataset",
     "extract_surrounding_highs",
     "load_ibtracs",
