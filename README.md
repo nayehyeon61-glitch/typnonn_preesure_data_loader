@@ -331,10 +331,14 @@ pytest
 
 ```mermaid
 flowchart TD
-    A["IBTrACS + ERA5 history"] --> C["Shared GRU encoder"]
+    A["IBTrACS + ERA5 history"] --> C["GRU history encoder"]
+    W["WeatherNext 0–15 day output"] --> T["Masked Transformer"]
+    T --> X["Fusion encoder"]
+    C --> X
     B["IBTrACS Earth-grid distribution"] --> D["15–30 day soft targets"]
-    C --> E["Global distribution head"]
-    C --> F["East Asia track head"]
+    X --> Q["15–30 day future queries"]
+    Q --> E["Cross-attention distribution head"]
+    X --> F["East Asia track head"]
     D --> G["Cross entropy"]
     E --> G
     F --> H["Masked location MSE"]
@@ -367,6 +371,23 @@ train-small-typhoon-model \
   --history 8 --track-steps 20 \
   --distribution-weight 1.0 --track-weight 1.0
 ```
+
+WeatherNext 연결 버전:
+
+```bash
+tokenize-weathernext-output \
+  --forecast data/weathernext/forecast.nc \
+  --storm-id 2025001N12000 \
+  --init-time 2025-08-01T00:00:00 \
+  --output-dir data/weathernext_tokens
+
+train-weathernext-transformer \
+  --integrated data/integrated_typhoon_pressure.parquet \
+  --distribution data/distribution/spatial_distribution.csv \
+  --weathernext-token-dir data/weathernext_tokens
+```
+
+Transformer 입력에는 변수별 결측 mask, token attention mask, history mask와 기본 15% random input mask를 모두 적용합니다. WeatherNext의 0–15일 예측 전체는 사용 가능한 입력이므로 causal mask는 두지 않으며, 15–30일 target은 입력에서 완전히 분리됩니다.
 
 자세한 데이터 계약과 설계 근거는 [`small_version/README.md`](src/typhoon_pressure/small_version/README.md)에 정리했습니다.
 

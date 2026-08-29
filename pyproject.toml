@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "typhoon-pressure-data-loader"
-version = "0.2.0"
+version = "0.3.0"
 description = "Join IBTrACS typhoon tracks with surrounding ERA5 high-pressure centres"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24", "pandas>=2", "scipy>=1.10", "xarray>=2023.1", "torch>=2"]
@@ -20,6 +20,8 @@ small = [
 build-typhoon-pressure-data = "typhoon_pressure.cli:main"
 build-typhoon-distribution-targets = "typhoon_pressure.small_version.prepare_distribution:main"
 train-small-typhoon-model = "typhoon_pressure.small_version.train:main"
+tokenize-weathernext-output = "typhoon_pressure.small_version.tokenize_weathernext:main"
+train-weathernext-transformer = "typhoon_pressure.small_version.train_transformer:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

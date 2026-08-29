@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from .config import EastAsiaBounds, SmallModelConfig
+from .config import EastAsiaBounds, SmallModelConfig, TransformerConfig
 
 
 class SmallDualScaleModel(nn.Module):
@@ -41,3 +41,137 @@ class SmallDualScaleModel(nn.Module):
         lon = self.bounds.lon_min + (self.bounds.lon_max - self.bounds.lon_min) * unit_track[..., 1]
         return {"distribution_logits": distribution_logits, "track_latlon": torch.stack((lat, lon), dim=-1)}
 
+
+class WeatherNextFusionTransformer(nn.Module):
+    """Fuse masked 0–15 day WeatherNext tokens with observed history."""
+
+    def __init__(
+        self,
+        model_config: SmallModelConfig,
+        transformer_config: TransformerConfig,
+        bounds: EastAsiaBounds = EastAsiaBounds(),
+    ):
+        super().__init__()
+        self.model_config = model_config
+        self.transformer_config = transformer_config
+        self.bounds = bounds
+        hidden = model_config.hidden_dim
+
+        self.history_projection = nn.Sequential(
+            nn.Linear(model_config.input_dim * 2, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+        )
+        self.history_encoder = nn.GRU(hidden, hidden, batch_first=True)
+
+        forecast_projection_dim = transformer_config.forecast_input_dim * 2 + 6
+        self.forecast_projection = nn.Sequential(
+            nn.Linear(forecast_projection_dim, transformer_config.model_dim),
+            nn.LayerNorm(transformer_config.model_dim),
+        )
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, transformer_config.model_dim))
+        nn.init.normal_(self.cls_token, std=0.02)
+        layer = nn.TransformerEncoderLayer(
+            d_model=transformer_config.model_dim,
+            nhead=transformer_config.num_heads,
+            dim_feedforward=transformer_config.feedforward_dim,
+            dropout=transformer_config.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.forecast_encoder = nn.TransformerEncoder(layer, transformer_config.num_layers)
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden + transformer_config.model_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+        )
+        self.history_to_forecast_dim = nn.Linear(hidden, transformer_config.model_dim)
+        self.future_queries = nn.Parameter(torch.zeros(
+            1, len(model_config.lead_days), transformer_config.model_dim
+        ))
+        nn.init.normal_(self.future_queries, std=0.02)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=transformer_config.model_dim,
+            nhead=transformer_config.num_heads,
+            dim_feedforward=transformer_config.feedforward_dim,
+            dropout=transformer_config.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.future_decoder = nn.TransformerDecoder(
+            decoder_layer, transformer_config.decoder_layers
+        )
+        self.distribution_projection = nn.Linear(
+            transformer_config.model_dim, model_config.n_cells
+        )
+        self.track_head = nn.Linear(hidden, model_config.local_track_steps * 2)
+
+    def _apply_input_mask(
+        self,
+        values: torch.Tensor,
+        feature_mask: torch.Tensor,
+        token_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Combine missing-data, token-validity and random training masks."""
+        effective_feature_mask = feature_mask.bool()
+        probability = self.transformer_config.input_mask_probability
+        if self.training and probability > 0:
+            random_keep = torch.rand_like(values) >= probability
+            effective_feature_mask = effective_feature_mask & random_keep
+        effective_token_mask = token_mask.bool() & effective_feature_mask.any(dim=-1)
+        masked_values = torch.where(effective_feature_mask, values, torch.zeros_like(values))
+        return masked_values, effective_feature_mask.to(values.dtype), effective_token_mask
+
+    def forward(
+        self,
+        history: torch.Tensor,
+        history_mask: torch.Tensor,
+        forecast_values: torch.Tensor,
+        forecast_feature_mask: torch.Tensor,
+        forecast_token_mask: torch.Tensor,
+        forecast_positions: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        masked_history = torch.where(history_mask.bool(), history, torch.zeros_like(history))
+        history_input = self.history_projection(torch.cat((masked_history, history_mask), dim=-1))
+        _, history_hidden = self.history_encoder(history_input)
+
+        masked_values, effective_feature_mask, effective_token_mask = self._apply_input_mask(
+            forecast_values, forecast_feature_mask, forecast_token_mask
+        )
+        forecast_input = self.forecast_projection(torch.cat((
+            masked_values, effective_feature_mask, forecast_positions,
+        ), dim=-1))
+        cls = self.cls_token.expand(forecast_input.shape[0], -1, -1)
+        forecast_input = torch.cat((cls, forecast_input), dim=1)
+        # CLS is always valid, preventing all-masked sequences from producing NaNs.
+        padding_mask = torch.cat((
+            torch.zeros((effective_token_mask.shape[0], 1), dtype=torch.bool, device=effective_token_mask.device),
+            ~effective_token_mask,
+        ), dim=1)
+        forecast_memory = self.forecast_encoder(
+            forecast_input, src_key_padding_mask=padding_mask
+        )
+        forecast_state = forecast_memory[:, 0]
+        state = self.fusion(torch.cat((history_hidden[-1], forecast_state), dim=-1))
+
+        # One learned query per future day cross-attends to the masked 0–15 day memory.
+        queries = self.future_queries.expand(history.shape[0], -1, -1)
+        queries = queries + self.history_to_forecast_dim(state).unsqueeze(1)
+        future_states = self.future_decoder(
+            tgt=queries,
+            memory=forecast_memory,
+            memory_key_padding_mask=padding_mask,
+        )
+        distribution_logits = self.distribution_projection(future_states)
+        raw_track = self.track_head(state).view(-1, self.model_config.local_track_steps, 2)
+        unit_track = torch.sigmoid(raw_track)
+        lat = self.bounds.lat_min + (self.bounds.lat_max - self.bounds.lat_min) * unit_track[..., 0]
+        lon = self.bounds.lon_min + (self.bounds.lon_max - self.bounds.lon_min) * unit_track[..., 1]
+        return {
+            "distribution_logits": distribution_logits,
+            "track_latlon": torch.stack((lat, lon), dim=-1),
+            "effective_forecast_token_fraction": effective_token_mask.float().mean().detach(),
+            "effective_forecast_feature_fraction": effective_feature_mask.mean().detach(),
+        }

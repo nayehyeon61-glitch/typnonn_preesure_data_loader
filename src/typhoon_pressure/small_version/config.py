@@ -52,3 +52,41 @@ class DualLossConfig:
     local_track_weight: float = 1.0
     track_scale_km: float = 500.0
 
+
+@dataclass(frozen=True)
+class WeatherNextTokenConfig:
+    """Compression settings for a small Transformer over WeatherNext fields."""
+
+    variables: tuple[str, ...] = (
+        "mean_sea_level_pressure",
+        "10m_u_component_of_wind",
+        "10m_v_component_of_wind",
+        "2m_temperature",
+    )
+    max_lead_hours: int = 360
+    max_time_steps: int = 10
+    target_lat_tokens: int = 6
+    target_lon_tokens: int = 12
+    min_valid_fraction: float = 0.5
+
+    @property
+    def max_tokens(self) -> int:
+        return self.max_time_steps * self.target_lat_tokens * self.target_lon_tokens
+
+
+@dataclass(frozen=True)
+class TransformerConfig:
+    forecast_input_dim: int
+    model_dim: int = 128
+    num_heads: int = 8
+    num_layers: int = 4
+    decoder_layers: int = 2
+    feedforward_dim: int = 384
+    dropout: float = 0.1
+    input_mask_probability: float = 0.15
+
+    def __post_init__(self):
+        if self.model_dim % self.num_heads:
+            raise ValueError("model_dim must be divisible by num_heads")
+        if not 0.0 <= self.input_mask_probability < 1.0:
+            raise ValueError("input_mask_probability must be in [0, 1)")

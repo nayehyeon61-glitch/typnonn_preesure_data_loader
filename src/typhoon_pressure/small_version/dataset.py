@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .config import EastAsiaBounds, SmallModelConfig
+from .weathernext_bridge import DirectoryForecastTokenStore
 
 
 @dataclass
@@ -99,3 +100,57 @@ class DualTargetDataset(Dataset):
             "storm_id": sample["storm_id"],
             "init_time_ns": sample["init_time_ns"],
         }
+
+
+class WeatherNextDualTargetDataset(DualTargetDataset):
+    """Dual targets plus a fixed-size, fully masked WeatherNext token sequence."""
+
+    def __init__(
+        self,
+        base_dataset: Dataset,
+        distribution: SpatialDistributionLookup,
+        model_config: SmallModelConfig,
+        forecast_store: DirectoryForecastTokenStore,
+        *,
+        max_forecast_tokens: int,
+        forecast_input_dim: int,
+        bounds: EastAsiaBounds = EastAsiaBounds(),
+    ):
+        super().__init__(base_dataset, distribution, model_config, bounds)
+        self.forecast_store = forecast_store
+        self.max_forecast_tokens = max_forecast_tokens
+        self.forecast_input_dim = forecast_input_dim
+        self.indices = []
+        for index in range(len(self.base)):
+            sample = self.base[index]
+            if self.forecast_store.contains(sample["storm_id"], sample["init_time_ns"]):
+                self.indices.append(index)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        base_index = self.indices[index]
+        sample = super().__getitem__(base_index)
+        tokens = self.forecast_store.load(sample["storm_id"], sample["init_time_ns"])
+        if tokens.values.shape[1] != self.forecast_input_dim:
+            raise ValueError(
+                f"WeatherNext feature count {tokens.values.shape[1]} does not match "
+                f"forecast_input_dim={self.forecast_input_dim}"
+            )
+        count = min(len(tokens.values), self.max_forecast_tokens)
+        values = np.zeros((self.max_forecast_tokens, self.forecast_input_dim), dtype=np.float32)
+        feature_mask = np.zeros_like(values)
+        token_mask = np.zeros(self.max_forecast_tokens, dtype=np.float32)
+        positions = np.zeros((self.max_forecast_tokens, 6), dtype=np.float32)
+        values[:count] = tokens.values[:count]
+        feature_mask[:count] = tokens.feature_mask[:count]
+        token_mask[:count] = tokens.token_mask[:count]
+        positions[:count] = tokens.positions[:count]
+        sample.update({
+            "forecast_values": torch.from_numpy(values),
+            "forecast_feature_mask": torch.from_numpy(feature_mask),
+            "forecast_token_mask": torch.from_numpy(token_mask),
+            "forecast_positions": torch.from_numpy(positions),
+        })
+        return sample

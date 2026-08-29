@@ -32,8 +32,24 @@ def train_epoch(model, loader, optimizer, criterion, device: torch.device) -> di
     for batch in loader:
         tensors = {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
         optimizer.zero_grad(set_to_none=True)
-        outputs = model(tensors["history"], tensors["history_mask"])
+        if "forecast_values" in tensors:
+            outputs = model(
+                tensors["history"],
+                tensors["history_mask"],
+                tensors["forecast_values"],
+                tensors["forecast_feature_mask"],
+                tensors["forecast_token_mask"],
+                tensors["forecast_positions"],
+            )
+        else:
+            outputs = model(tensors["history"], tensors["history_mask"])
         losses = criterion(outputs, tensors)
+        for metric in (
+            "effective_forecast_token_fraction",
+            "effective_forecast_feature_fraction",
+        ):
+            if metric in outputs:
+                losses[metric] = outputs[metric]
         losses["loss"].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
