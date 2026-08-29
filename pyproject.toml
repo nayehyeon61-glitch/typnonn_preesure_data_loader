@@ -24,6 +24,7 @@ weathernext = [
 build-typhoon-pressure-data = "typhoon_pressure.cli:main"
 build-typhoon-distribution-targets = "typhoon_pressure.small_version.prepare_distribution:main"
 train-small-typhoon-model = "typhoon_pressure.small_version.train:main"
+prepare-weathernext-pipeline = "typhoon_pressure.prepare_weathernext_pipeline:main"
 tokenize-weathernext-output = "typhoon_pressure.small_version.tokenize_weathernext:main"
 train-weathernext-transformer = "typhoon_pressure.small_version.train_transformer:main"
 build-gpt-state-cache = "typhoon_pressure.small_version.build_gpt_state_cache:main"
