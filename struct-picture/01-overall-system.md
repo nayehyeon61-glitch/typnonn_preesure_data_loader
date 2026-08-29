@@ -1,5 +1,10 @@
 # 01. Overall System
 
+현재 시스템은 WeatherNext 2의 물리적 forecast dynamics를 고정하고, GPT가 생성한 synoptic state를 두 경로에서 능동적으로 사용합니다.
+
+1. History FiLM conditioning
+2. WeatherNext Token / Channel Router
+
 ```mermaid
 flowchart TB
     subgraph SOURCE["1. 원천 데이터"]
@@ -24,41 +29,66 @@ flowchart TB
     DS --> GT
     OBS --> TT
 
-    subgraph WNB["3-A. WeatherNext branch"]
+    subgraph WNB["3-A. Frozen WeatherNext dynamics"]
         direction TB
-        WN["WeatherNext 2<br/>0–15일 xarray output"]
+        RES["WeatherNext Resolver<br/>fine-tuned → pretrained → download → API"]
+        WN["WeatherNext 2<br/>Frozen rollout 0–15일"]
         TOK["Spatiotemporal tokenizer<br/>최대 720 tokens"]
-        FM["Feature·token·padding<br/>random input mask"]
+        FP["Value + mask + position projection"]
+        ROUTED["GPT-routed WeatherNext tokens"]
         TE["Masked Transformer Encoder"]
         MEM["WeatherNext memory + CLS"]
     end
 
-    INIT --> WN
+    INIT --> RES
+    RES --> WN
     WN --> TOK
-    TOK --> FM
-    FM --> TE
-    TE --> MEM
+    TOK --> FP
 
-    subgraph HB["3-B. GPT dynamic-history branch"]
+    subgraph GPTB["3-B. GPT semantic-state branch"]
         direction TB
         HIS["태풍·기압 History<br/>48시간"]
         SUM["Deterministic Summary"]
         API["GPT Structured Output<br/>10-state cache"]
-        FILM["FiLM scale / shift"]
-        DH["GPT-conditioned<br/>Dynamic History"]
-        GRU["Masked GRU Encoder"]
-        HH["Typhoon hidden"]
+        ZGPT["Semantic State z_GPT<br/>steering·recurvature·risk·uncertainty"]
     end
 
     IB --> HIS
     ERA --> HIS
     HIS --> SUM
     SUM --> API
-    API --> FILM
+    API --> ZGPT
+
+    subgraph ACTIVE["3-C. Active LLM control"]
+        direction LR
+        FILM["History FiLM<br/>γ, β"]
+        TGR["Token Gate<br/>g_token"]
+        CGR["Channel Gate<br/>g_channel"]
+    end
+
+    ZGPT --> FILM
+    ZGPT --> TGR
+    ZGPT --> CGR
     HIS --> FILM
+
+    subgraph HISTORY["History dynamics representation"]
+        direction TB
+        DH["GPT-conditioned history<br/>h'=(1+γ)h+β"]
+        GRU["Masked GRU Encoder"]
+        HH["Typhoon hidden state"]
+    end
+
     FILM --> DH
+    HIS --> DH
     DH --> GRU
     GRU --> HH
+
+    FP --> TGR
+    FP --> CGR
+    TGR --> ROUTED
+    CGR --> ROUTED
+    ROUTED --> TE
+    TE --> MEM
 
     subgraph MODEL["4. 공유 표현과 예측"]
         direction TB
@@ -79,7 +109,7 @@ flowchart TB
     FUS --> TH
     TH --> TP
 
-    subgraph OBJECTIVE["5. 두 loss와 공동학습"]
+    subgraph OBJECTIVE["5. Dual objective"]
         direction LR
         CE["Soft Distribution CE<br/>day mask"]
         MSE["Track MSE in km<br/>valid + region mask"]
@@ -97,8 +127,19 @@ flowchart TB
     TOTAL -. "gradient" .-> TH
     TOTAL -. "shared gradient" .-> FUS
     TOTAL -. "shared gradient" .-> TE
+    TOTAL -. "router gradient" .-> TGR
+    TOTAL -. "router gradient" .-> CGR
     TOTAL -. "shared gradient" .-> GRU
-    TOTAL -. "shared gradient" .-> FILM
+    TOTAL -. "FiLM gradient" .-> FILM
 ```
 
-WeatherNext 2와 GPT API는 외부 추론·전처리 단계입니다. 학습 gradient는 cache된 입력 이후의 Transformer, FiLM, GRU, fusion과 두 prediction head에 전달됩니다.
+## 핵심 해석
+
+```text
+WeatherNext 2 = frozen physical forecast dynamics
+GPT state     = semantic state
+GPT Router    = semantic state → routing policy
+Transformer   = routed WeatherNext representation learner
+```
+
+WeatherNext 2와 GPT API 자체에는 학습 gradient가 전달되지 않습니다. 반면 GPT state를 입력받는 FiLM adapter와 Token/Channel Router는 후단 loss에서 학습됩니다.
