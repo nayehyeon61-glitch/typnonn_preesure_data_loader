@@ -38,6 +38,7 @@ def test_ibtracs_evaluation_matches_absolute_time_and_optional_intensity():
         "pred_lon": [130.0, 131.0],
         "pred_pressure_hpa": [992.0, 980.0],
         "pred_wind_kt": [48.0, 65.0],
+        "weathernext_backend": ["pretrained", "pretrained"],
     })
     result = evaluate_ibtracs_predictions(predictions, _observations())
     assert result.overall["matched_count"] == 2
@@ -45,6 +46,7 @@ def test_ibtracs_evaluation_matches_absolute_time_and_optional_intensity():
     assert result.overall["pressure_hpa_mae"] == 3.5
     assert result.overall["wind_kt_bias"] == 1.5
     assert list(result.by_lead["lead_hours"]) == [0, 6]
+    assert result.by_backend.iloc[0]["weathernext_backend"] == "pretrained"
 
 
 def test_east_asia_filter_uses_ibtracs_target_position():
