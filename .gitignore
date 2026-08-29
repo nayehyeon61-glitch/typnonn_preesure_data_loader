@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 *.egg-info/
 data/
+download/
 checkpoints/
 *.pt
 weather-me-fine_tune_weight*.npz
