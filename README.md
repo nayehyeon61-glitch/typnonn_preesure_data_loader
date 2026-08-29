@@ -69,6 +69,48 @@ loader = DataLoader(dataset, batch_size=32, shuffle=True)
 
 WeatherNext 2의 전체 초기 대기장은 HRES/ERA5에서 가져오고, IBTrACS는 태풍 중심의 tracker seed와 선택적 vortex 보정 자료로 사용합니다.
 
+### 초기조건의 의미
+
+IBTrACS 한 지점은 태풍의 저차원 상태입니다.
+
+```text
+storm = [latitude, longitude, central pressure, maximum wind]
+```
+
+반면 WeatherNext 2의 초기조건은 위도·경도·고도·변수 축을 가진 전체 대기장입니다.
+
+```text
+initial_state[latitude, longitude, level, variable]
+```
+
+따라서 이 패키지는 IBTrACS를 전체 대기장의 대체재로 사용하지 않습니다. 다음과 같이 전체 분석장에 태풍 관측을 조건으로 결합합니다.
+
+```text
+HRES/ERA5 atmospheric state
+             +
+IBTrACS storm observation
+             |
+             v
+InitialConditionBuilder
+             |
+             +-- tracker_seed
+             +-- vortex_correction
+             +-- auto
+             |
+             v
+WeatherNextRequest
+```
+
+수식으로는 다음과 같습니다.
+
+```text
+X_initial = X_HRES/ERA5 + C(storm_IBTrACS)
+```
+
+`tracker_seed`에서는 `C=0`이므로 대기장을 수정하지 않습니다. `vortex_correction`에서는 태풍 중심 주변 MSLP anomaly만 보정합니다.
+
+### 권장 사용 예제
+
 ```python
 from typhoon_pressure import (
     CorrectionConfig,
@@ -100,6 +142,25 @@ request = make_weathernext_request(
 )
 ```
 
+생성되는 `WeatherInitialCondition`에는 보정된 대기장뿐 아니라 보정 판단에 사용된 정보가 포함됩니다.
+
+```python
+print(condition.applied_mode)
+print(condition.position_error_km)
+print(condition.pressure_error_hpa)
+print(condition.model_center_before)
+print(condition.metadata())
+```
+
+`WeatherNextRequest`의 구조는 다음과 같습니다.
+
+```python
+request.initial_state               # WN2에 전달할 전체 xarray.Dataset
+request.tracker_seed                # storm_id, time, lat, lon, pressure, wind
+request.horizon_hours               # 6시간 배수, 최대 360시간
+request.initialization_metadata     # 보정 전 중심과 오차 및 적용 모드
+```
+
 지원 모드:
 
 | mode | 동작 |
@@ -108,9 +169,146 @@ request = make_weathernext_request(
 | `vortex_correction` | IBTrACS 위치·기압을 기준으로 MSLP vortex를 이동·보정 |
 | `auto` | 위치 오차 100 km 또는 중심기압 오차 5 hPa 초과 시에만 보정 |
 
+### `auto` 모드의 판단 과정
+
+1. IBTrACS 시각과 가장 가까운 HRES/ERA5 시각을 선택합니다.
+2. IBTrACS 중심 반경 500 km에서 MSLP 국소 최솟값을 검색합니다.
+3. 모델 중심과 IBTrACS 중심의 great-circle distance를 계산합니다.
+4. 모델 중심기압과 IBTrACS 중심기압의 차이를 계산합니다.
+5. 위치 또는 기압 오차가 임계값을 넘을 때만 vortex correction을 적용합니다.
+
+```text
+position_error = great_circle(model_center, IBTrACS_center)
+pressure_error = model_pressure - IBTrACS_pressure
+
+correct = position_error > 100 km
+       or abs(pressure_error) > 5 hPa
+```
+
+태풍이 분석장에 이미 정확하게 표현되어 있으면 `auto`는 자동으로 `tracker_seed`를 선택하여 불필요한 field 변형을 방지합니다.
+
+### MSLP vortex correction
+
+보정은 분석장 전체를 이동시키지 않고 태풍 주변 anomaly에만 적용됩니다.
+
+```text
+background = GaussianSmooth(MSLP)
+vortex_anomaly = MSLP - background
+```
+
+기존 모델 중심 주변 anomaly를 제거하고, 해당 anomaly를 IBTrACS 중심으로 이동한 뒤 목표 중심기압과의 차이를 부드러운 거리 가중치로 적용합니다.
+
+```text
+weight(r) = exp(-0.5 * (r / correction_radius)^2)
+
+corrected_MSLP
+  = cleaned_background
+  + relocated_vortex
+  + weight(r) * pressure_adjustment
+```
+
+기본값:
+
+| 설정 | 기본값 | 의미 |
+|---|---:|---|
+| `position_threshold_km` | 100 km | 위치 보정 판단 기준 |
+| `pressure_threshold_hpa` | 5 hPa | 기압 보정 판단 기준 |
+| `search_radius_km` | 500 km | 분석장 태풍 중심 검색 반경 |
+| `correction_radius_km` | 400 km | vortex 보정 영향 반경 |
+| `max_pressure_correction_hpa` | 25 hPa | 과도한 중심기압 변경 방지 |
+| `local_window` | 7 | MSLP 국소 최솟값 검출 window |
+
+### WeatherNext runner 연결
+
+이 패키지는 대용량 JAX/TPU 의존성을 기본 loader에 강제로 설치하지 않도록 WN2 실행부를 protocol로 분리합니다.
+
+```python
+import xarray as xr
+
+from typhoon_pressure.weathernext_adapter import run_weathernext
+
+
+class MyWeatherNextRunner:
+    def __init__(self, model, checkpoint):
+        self.model = model
+        self.checkpoint = checkpoint
+
+    def rollout(
+        self,
+        initial_state: xr.Dataset,
+        horizon_hours: int,
+    ) -> xr.Dataset:
+        # 이 내부에서 version-pinned Google WN2/JAX 코드를 호출합니다.
+        return self.model.rollout(
+            initial_state=initial_state,
+            checkpoint=self.checkpoint,
+            steps=horizon_hours // 6,
+        )
+
+
+runner = MyWeatherNextRunner(model, checkpoint)
+forecast = run_weathernext(runner, request)
+```
+
+실제 연구에서는 WN2 패키지 버전을 고정하는 것을 권장합니다.
+
+```bash
+pip install \
+  git+https://github.com/google-deepmind/weathernext.git@v0.3.0
+```
+
+공개 운영 WN2 가중치는 HRES 초기조건에 맞춰져 있으므로 실제 추론에는 HRES 사용을 우선 권장합니다. ERA5는 과거 실험, 전처리 검증과 보정 ablation에 사용할 수 있습니다.
+
+### 보정 전후 평가
+
+동일한 초기 시각과 태풍에 대해 다음 세 실험을 분리하십시오.
+
+| 실험 | 대기장 | IBTrACS 역할 |
+|---|---|---|
+| Baseline | 원본 HRES/ERA5 | 사용하지 않음 |
+| Tracker seed | 원본 HRES/ERA5 | 추적 초기 중심 |
+| Corrected | 보정된 HRES/ERA5 | 추적 중심 + MSLP 보정 |
+
+권장 평가 항목:
+
+```text
+6h/24h/72h/120h/360h track error (km)
+central pressure error (hPa)
+maximum wind error
+first-step pressure tendency
+ensemble track spread
+vortex continuity after the first rollout
+```
+
+특히 첫 6시간 예측에서 중심기압이나 풍속이 갑자기 변하면 초기장이 동역학적으로 불균형하다는 신호입니다.
+
+### 학습 sample에 초기화 metadata 포함
+
+```python
+sample = {
+    "storm_id": condition.storm.storm_id,
+    "init_time": condition.storm.time,
+    "initial_state": request.initial_state,
+    "tracker_seed": request.tracker_seed,
+    "initialization_metadata": request.initialization_metadata,
+    "target_15d": target,
+}
+```
+
+`initialization_metadata`를 보존하면 보정 여부에 따른 성능을 별도로 분석할 수 있습니다.
+
 `WeatherNextRequest`는 `initial_state`, `tracker_seed`, `horizon_hours`, 보정 metadata를 분리합니다. 실제 Google WN2 호출은 버전을 고정한 JAX/TPU runner에서 수행하도록 `WeatherNextRunner` 경계로 분리했습니다.
 
 > 현재 vortex correction은 실험적인 MSLP-only 보정입니다. WN2 성능 실험에서는 `tracker_seed`를 baseline으로 두고, MSLP 보정 후 첫 rollout에서 바람·온도·습도장의 동역학적 균형이 유지되는지 반드시 비교해야 합니다.
+
+### 현재 제한사항과 다음 확장
+
+- 현재 위치·강도 보정은 `mean_sea_level_pressure`에만 적용됩니다.
+- 경도 경계가 포함된 전 지구 field의 vortex 이동은 추가적인 cyclic interpolation 검증이 필요합니다.
+- 기압만 바꾸면 바람과 열역학장의 균형이 깨질 수 있으므로 운영 예측에 바로 사용하면 안 됩니다.
+- 다음 버전에서는 10 m/850 hPa 바람, 온도, 습도 anomaly를 함께 이동·스케일링해야 합니다.
+- 보정된 field는 WN2가 기대하는 변수명, 단위, pressure level 및 좌표 순서를 만족해야 합니다.
+- IBTrACS는 best-track 사후분석 자료이므로 실시간 시스템에서는 실제 operational advisory 자료로 교체해야 합니다.
 
 ## CLI
 
