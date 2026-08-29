@@ -61,5 +61,5 @@ class TyphoonPressureDataset(Dataset):
             "history": history, "history_mask": history_mask,
             "target": target, "target_mask": target_mask,
             "storm_id": storm_id,
+            "init_time_ns": int(frame.iloc[self.history - 1]["time"].value),
         }
-

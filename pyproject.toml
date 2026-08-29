@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "typhoon-pressure-data-loader"
-version = "0.1.0"
+version = "0.2.0"
 description = "Join IBTrACS typhoon tracks with surrounding ERA5 high-pressure centres"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24", "pandas>=2", "scipy>=1.10", "xarray>=2023.1", "torch>=2"]
@@ -12,13 +12,17 @@ dependencies = ["numpy>=1.24", "pandas>=2", "scipy>=1.10", "xarray>=2023.1", "to
 [project.optional-dependencies]
 io = ["dask[array]>=2023.1", "netCDF4>=1.6", "pyarrow>=12"]
 test = ["pytest>=7"]
+small = [
+  "typhoon-distribution @ git+https://github.com/nayehyeon61-glitch/typnoon-disribution.git@83223fd4c7703ec75c4a60d5cab1cfba59aacc7a",
+]
 
 [project.scripts]
 build-typhoon-pressure-data = "typhoon_pressure.cli:main"
+build-typhoon-distribution-targets = "typhoon_pressure.small_version.prepare_distribution:main"
+train-small-typhoon-model = "typhoon_pressure.small_version.train:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

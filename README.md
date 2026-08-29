@@ -325,6 +325,51 @@ build-typhoon-pressure-data \
 pytest
 ```
 
+## 5. Small version: 두 가지 loss 학습
+
+`src/typhoon_pressure/small_version/`은 [typnoon-disribution](https://github.com/nayehyeon61-glitch/typnoon-disribution)이 생성한 지구 격자분포와 이 저장소의 태풍·기압 history를 연결합니다.
+
+```mermaid
+flowchart TD
+    A["IBTrACS + ERA5 history"] --> C["Shared GRU encoder"]
+    B["IBTrACS Earth-grid distribution"] --> D["15–30 day soft targets"]
+    C --> E["Global distribution head"]
+    C --> F["East Asia track head"]
+    D --> G["Cross entropy"]
+    E --> G
+    F --> H["Masked location MSE"]
+    I["IBTrACS local track"] --> H
+    G --> J["Weighted total loss"]
+    H --> J
+```
+
+```text
+L_total = lambda_distribution * CE(IBTrACS distribution, predicted distribution)
+        + lambda_track * MSE(East Asia target track, predicted track)
+```
+
+- 전 지구 head: 초기시각 기준 15–30일 뒤 IBTrACS 월별 공간분포를 soft target으로 사용
+- 국지 head: 동아시아 `0–60°N, 100–180°E`에 있는 미래 위치만 mask하여 경로 loss 계산
+- 기본 local horizon: 6시간 간격 20 step(5일)
+- MSE는 km 단위 위치오차를 500 km로 정규화해 CE와 loss scale을 맞추며, 실제 RMSE(km)를 별도로 기록
+
+```bash
+pip install -e '.[io,small]'
+
+build-typhoon-distribution-targets \
+  --ibtracs data/IBTrACS.ALL.v04r01.csv \
+  --basins WP \
+  --output-dir data/distribution
+
+train-small-typhoon-model \
+  --integrated data/integrated_typhoon_pressure.parquet \
+  --distribution data/distribution/spatial_distribution.csv \
+  --history 8 --track-steps 20 \
+  --distribution-weight 1.0 --track-weight 1.0
+```
+
+자세한 데이터 계약과 설계 근거는 [`small_version/README.md`](src/typhoon_pressure/small_version/README.md)에 정리했습니다.
+
 ## 중요한 설계 조건
 
 - IBTrACS CSV의 두 번째 행은 단위 행이므로 자동으로 건너뜁니다.
