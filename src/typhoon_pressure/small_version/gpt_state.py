@@ -188,6 +188,37 @@ class DirectoryGPTStateStore:
                 mask=data["mask"].astype(np.float32),
             )
 
+    def missing_keys(self, keys) -> list[tuple[str, int]]:
+        return sorted(
+            (str(storm_id), int(init_time_ns))
+            for storm_id, init_time_ns in keys
+            if not self.contains(storm_id, init_time_ns)
+        )
+
+    def validate_coverage(self, keys, *, require_valid: bool = False) -> dict[str, int]:
+        """Require a cache entry for every WeatherNext token key before training."""
+        normalized = [(str(storm_id), int(init_time_ns)) for storm_id, init_time_ns in keys]
+        missing = self.missing_keys(normalized)
+        if missing:
+            preview = ", ".join(map(str, missing[:5]))
+            raise ValueError(
+                f"GPT state cache is missing {len(missing)} WeatherNext samples: {preview}. "
+                "Run build-gpt-state-cache first with matching dataset/history settings."
+            )
+        masked = 0
+        for key in normalized:
+            record = self.load(*key)
+            if record.values.shape != (self.state_dim,) or record.mask.shape != (self.state_dim,):
+                raise ValueError(f"GPT state {key} has inconsistent dimensions")
+            if not np.all(record.mask > 0):
+                masked += 1
+        if require_valid and masked:
+            raise ValueError(
+                f"GPT state cache contains {masked} masked/API-failure entries; "
+                "rebuild the cache or omit --require-valid-gpt-states"
+            )
+        return {"keys": len(normalized), "masked": masked}
+
 
 class WeatherNextGPTDualTargetDataset(WeatherNextDualTargetDataset):
     """Attach cached GPT state; absent samples become all-zero masked states."""

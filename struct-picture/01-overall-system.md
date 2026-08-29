@@ -6,7 +6,8 @@
 flowchart TB
     subgraph SOURCE["1. Source and targets"]
         IB["IBTrACS<br/>track, wind, pressure, time"]
-        ATM["HRES or ERA5<br/>atmospheric initial state"]
+        ATM["HRES or ERA5<br/>atmospheric fields"]
+        SUP["Supplement sources<br/>SST, static, 100 m wind"]
         DISTDATA["typnoon-disribution<br/>monthly Earth distribution"]
         DISTGT["Day 15–30 soft grid target<br/>B×16×2592"]
         TRACKGT["East Asia track target<br/>valid and region mask"]
@@ -17,8 +18,9 @@ flowchart TB
     IB --> TRACKGT
 
     subgraph OFFLINE["2. Offline or upstream inference"]
-        INIT["InitialConditionBuilder<br/>absolute-time and grid alignment"]
-        RES["WeatherNext Resolver<br/>fine-tuned → local official → download → API"]
+        PREP["WeatherNextInputPreparer<br/>merge, 2 times, 13 levels, global grid"]
+        INIT["InitialConditionBuilder<br/>tracker seed or vortex correction"]
+        RES["Execution mode<br/>pretrained, API, or trainable"]
         ROLLOUT["Resolved WeatherNext rollout<br/>0–15 days"]
         TOKENIZE["Spatiotemporal tokenizer<br/>values, masks, positions"]
         SUMMARY["Deterministic history summary"]
@@ -26,8 +28,10 @@ flowchart TB
         CACHE["10D semantic-state cache<br/>values and state mask"]
     end
 
+    ATM --> PREP
+    SUP --> PREP
+    PREP --> INIT
     IB --> INIT
-    ATM --> INIT
     INIT --> RES
     RES --> ROLLOUT
     ROLLOUT --> TOKENIZE
@@ -119,9 +123,10 @@ flowchart TB
 
 | 구성요소 | downstream 학습 상태 | 비고 |
 |---|---:|---|
-| Resolved WeatherNext rollout | 고정 | fine-tuned checkpoint도 이 단계에서는 inference-only |
+| Pretrained/API WeatherNext rollout | 고정 | 공식/fine-tuned checkpoint와 API는 inference-only |
+| Trainable WeatherNext mode | upstream 별도 학습 | 명시적 factory로 fit 후 token 생성; dual loss와 autograd 연결 없음 |
 | GPT API와 state cache | 고정 | 학습 loop에서 API를 호출하지 않음 |
 | FiLM, GPTForecastRouter | 학습 | 두 loss의 gradient를 받음 |
 | GRU, Transformer, Fusion, Decoder, Heads | 학습 | 공동 최적화 |
 
-GPT cache가 누락되거나 masked이면 FiLM은 `γ=β=0`, Router는 `g_token=g_channel=1`이 되어 두 경로 모두 정확한 identity fallback을 사용합니다.
+`--gpt-state-dir`을 지정하면 학습 시작 전에 모든 WeatherNext token key의 GPT cache 존재 여부를 검사합니다. 존재하지만 API 실패로 masked된 record는 FiLM `γ=β=0`, Router `g_token=g_channel=1`의 identity fallback이며, `--require-valid-gpt-states`로 이 경우도 오류 처리할 수 있습니다.

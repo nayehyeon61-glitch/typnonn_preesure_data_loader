@@ -407,7 +407,7 @@ train-weathernext-transformer \
   --gpt-state-dir data/gpt_states
 ```
 
-API 실패나 state cache 누락은 임의 값으로 대체하지 않습니다. 10차원 값과 mask를 모두 0으로 두어 FiLM은 `γ=β=0`, Router는 `g_token=g_channel=1`인 exact identity fallback을 사용합니다. `--gpt-state-dir`을 생략하면 GPT adapter module 자체가 생성되지 않습니다.
+API 실패 record는 임의 값으로 대체하지 않습니다. 10차원 값과 mask를 모두 0으로 두어 FiLM은 `γ=β=0`, Router는 `g_token=g_channel=1`인 exact identity fallback을 사용합니다. `--gpt-state-dir`을 지정하면 token key 전체의 cache coverage를 학습 전에 검사하며, 생략하면 GPT adapter module 자체가 생성되지 않습니다.
 
 자세한 데이터 계약과 설계 근거는 [`small_version/README.md`](src/typhoon_pressure/small_version/README.md)에 정리했습니다.
 

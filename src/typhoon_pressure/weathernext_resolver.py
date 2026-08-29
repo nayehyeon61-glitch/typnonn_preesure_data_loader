@@ -18,6 +18,14 @@ class CheckpointOrigin(str, Enum):
     OFFICIAL = "official"
     DOWNLOADED = "downloaded"
     API = "api"
+    TRAINED = "trained"
+
+
+class WeatherNextExecutionMode(str, Enum):
+    AUTO = "auto"
+    PRETRAINED = "pretrained"
+    API = "api"
+    TRAINABLE = "trainable"
 
 
 class CheckpointDownloader(Protocol):
@@ -40,8 +48,8 @@ class WeatherNextSelectionConfig:
     3) downloaded official checkpoint
     4) API forecast fallback
 
-    Training is intentionally excluded from this resolver so inference cannot
-    accidentally start fine-tuning.
+    ``pretrained`` always performs frozen inference. ``trainable`` is opt-in and
+    requires an injected trainable model plus training data.
     """
 
     model_variant: str = "WeatherNext2"
@@ -52,6 +60,12 @@ class WeatherNextSelectionConfig:
     allow_download: bool = True
     allow_api_fallback: bool = True
     api_provider: str | None = None
+    execution_mode: WeatherNextExecutionMode | str = WeatherNextExecutionMode.AUTO
+    training_kwargs: dict = None
+
+    @property
+    def mode(self) -> WeatherNextExecutionMode:
+        return WeatherNextExecutionMode(self.execution_mode)
 
 
 @dataclass
@@ -61,6 +75,7 @@ class ResolvedWeatherNext:
     runner: object
     origin: CheckpointOrigin
     checkpoint: str | None
+    frozen: bool = True
 
     def rollout(self, initial_state: xr.Dataset, horizon_hours: int) -> xr.Dataset:
         return self.runner.rollout(initial_state, horizon_hours)
@@ -74,6 +89,7 @@ class ResolvedWeatherNext:
             {
                 "weathernext_weight_origin": self.origin.value,
                 "weathernext_resolved_checkpoint": self.checkpoint,
+                "weathernext_frozen": str(self.frozen).lower(),
             }
         )
         return attrs
@@ -103,8 +119,54 @@ def resolve_weathernext(
     *,
     downloader: CheckpointDownloader | None = None,
     api_client=None,
+    trainable_model=None,
+    training_data=None,
+    fit_trainable: bool = True,
 ) -> ResolvedWeatherNext:
-    """Resolve exactly one frozen WeatherNext source by fixed priority."""
+    """Resolve one explicit execution mode, or use the legacy auto priority."""
+
+    if config.mode is WeatherNextExecutionMode.TRAINABLE:
+        runner = build_weathernext_runner(
+            WeatherNextBackendConfig(
+                backend="trainable",
+                model_id=config.model_id,
+                model_variant=config.model_variant,
+                release=config.release,
+                training_kwargs=config.training_kwargs or {},
+            ),
+            trainable_model=trainable_model,
+            training_data=training_data,
+        )
+        if fit_trainable:
+            runner.fit()
+        return ResolvedWeatherNext(
+            runner=runner,
+            origin=CheckpointOrigin.TRAINED,
+            checkpoint=config.finetuned_checkpoint,
+            frozen=False,
+        )
+
+    if config.mode is WeatherNextExecutionMode.API:
+        if api_client is None:
+            raise ValueError("api execution mode requires an injected api_client")
+        if not config.api_provider:
+            raise ValueError("api_provider is required for WeatherNext API mode")
+        runner = build_weathernext_runner(
+            WeatherNextBackendConfig(
+                backend="api",
+                model_id=config.model_id,
+                model_variant=config.model_variant,
+                release=config.release,
+                api_provider=config.api_provider,
+            ),
+            api_client=api_client,
+        )
+        return ResolvedWeatherNext(
+            runner=runner,
+            origin=CheckpointOrigin.API,
+            checkpoint=None,
+            frozen=True,
+        )
 
     finetuned = _existing_checkpoint(config.finetuned_checkpoint)
     if finetuned is not None:
@@ -141,7 +203,11 @@ def resolve_weathernext(
             checkpoint=str(downloaded),
         )
 
-    if config.allow_api_fallback and api_client is not None:
+    if (
+        config.mode is WeatherNextExecutionMode.AUTO
+        and config.allow_api_fallback
+        and api_client is not None
+    ):
         if not config.api_provider:
             raise ValueError("api_provider is required for WeatherNext API fallback")
         runner = build_weathernext_runner(
@@ -167,7 +233,7 @@ def resolve_weathernext(
         attempted.append(f"pretrained={config.pretrained_checkpoint}")
     if config.allow_download:
         attempted.append("download")
-    if config.allow_api_fallback:
+    if config.mode is WeatherNextExecutionMode.AUTO and config.allow_api_fallback:
         attempted.append("api")
     detail = ", ".join(attempted) if attempted else "no source configured"
     raise RuntimeError(f"No usable WeatherNext source found ({detail})")

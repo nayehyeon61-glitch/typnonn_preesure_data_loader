@@ -4,9 +4,9 @@
 
 ```mermaid
 flowchart TB
-    INIT["Aligned initial condition"]
-    RES["Priority resolver"]
-    WN["Resolved WeatherNext inference<br/>0–15 days, frozen downstream"]
+    INIT["Prepared initial condition<br/>2 times, full grid, required variables"]
+    RES["Execution mode selector"]
+    WN["Resolved WeatherNext rollout<br/>0–15 days; token boundary"]
     XR["xarray forecast<br/>lead × lat × lon × variable"]
 
     INIT --> RES

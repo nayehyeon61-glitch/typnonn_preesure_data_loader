@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from typhoon_pressure.small_version.config import GPTStateConfig
 from typhoon_pressure.small_version.gpt_state import (
@@ -54,3 +55,13 @@ def test_missing_gpt_state_is_fully_masked():
     record = GPTStateRecord.missing()
     assert np.all(record.values == 0)
     assert np.all(record.mask == 0)
+
+
+def test_gpt_cache_coverage_is_checked_before_router_training(tmp_path):
+    save_gpt_state(GPTStateRecord.missing(), tmp_path, storm_id="A", init_time_ns=1, status="masked")
+    store = DirectoryGPTStateStore(tmp_path)
+    assert store.validate_coverage([("A", 1)]) == {"keys": 1, "masked": 1}
+    with pytest.raises(ValueError, match="missing 1"):
+        store.validate_coverage([("A", 1), ("B", 2)])
+    with pytest.raises(ValueError, match="masked/API-failure"):
+        store.validate_coverage([("A", 1)], require_valid=True)

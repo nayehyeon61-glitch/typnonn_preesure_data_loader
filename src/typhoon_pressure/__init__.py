@@ -17,13 +17,21 @@ from .weathernext_backends import (
 from .weathernext_download import URLCheckpointDownloader
 from .weathernext_official import OfficialWeatherNextRunner
 from .weathernext_pipeline import (
+    WeatherNextBatchResult,
     WeatherNextPreparationResult,
+    prepare_weathernext_batch,
     prepare_weathernext_sample,
+)
+from .weathernext_input import (
+    WeatherNextInputConfig,
+    merge_weathernext_sources,
+    prepare_weathernext_input,
 )
 from .weathernext_resolver import (
     CheckpointOrigin,
     ResolvedWeatherNext,
     WeatherNextSelectionConfig,
+    WeatherNextExecutionMode,
     resolve_weathernext,
 )
 
@@ -43,9 +51,15 @@ __all__ = [
     "CheckpointOrigin",
     "ResolvedWeatherNext",
     "WeatherNextSelectionConfig",
+    "WeatherNextExecutionMode",
     "resolve_weathernext",
     "URLCheckpointDownloader",
     "WeatherNextPreparationResult",
+    "WeatherNextBatchResult",
+    "WeatherNextInputConfig",
+    "prepare_weathernext_batch",
+    "prepare_weathernext_input",
+    "merge_weathernext_sources",
     "prepare_weathernext_sample",
     "build_integrated_dataset",
     "extract_surrounding_highs",

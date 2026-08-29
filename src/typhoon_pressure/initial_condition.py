@@ -99,6 +99,20 @@ def _time_history_state(
         if old in state.variables or old in state.dims
     }
     state = state.rename(rename)
+    if "time" in state.dims and not np.issubdtype(state.time.dtype, np.datetime64):
+        if "datetime" not in state.coords:
+            raise ValueError("Relative time input requires an absolute 'datetime' coordinate")
+        datetimes = state.datetime
+        if "batch" in datetimes.dims:
+            if state.sizes.get("batch") != 1:
+                raise ValueError("InitialConditionBuilder supports batch size 1")
+            datetimes = datetimes.isel(batch=0)
+            state = state.isel(batch=0, drop=True)
+        if datetimes.dims != ("time",):
+            raise ValueError("datetime coordinate must have time or batch,time dimensions")
+        state = state.drop_vars("datetime").assign_coords(
+            time=np.asarray(datetimes.values).astype("datetime64[ns]")
+        )
     if "time" not in state.dims:
         if history_steps != 1:
             raise ValueError("Multiple WeatherNext history steps require a time dimension")

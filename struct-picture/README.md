@@ -17,12 +17,16 @@
 
 ```mermaid
 flowchart TB
-    subgraph UPSTREAM["Frozen upstream outputs"]
+    subgraph UPSTREAM["Upstream outputs"]
+        INPUT["Prepared global input<br/>2 times + 13 levels"]
+        MODE["WeatherNext mode<br/>pretrained, API, trainable"]
         WN["Resolved WeatherNext rollout<br/>0–15 days"]
         TOK["WeatherNext tokens<br/>values, masks, positions"]
         GPT["Cached GPT semantic state<br/>values + state mask"]
     end
 
+    INPUT --> MODE
+    MODE --> WN
     WN --> TOK
 
     subgraph HISTORY["History branch"]
@@ -79,13 +83,15 @@ flowchart TB
 | 항목 | 현재 구현 |
 |---|---|
 | History | 6시간 간격 8 step, 총 48시간 |
-| WeatherNext source | local fine-tuned → local official/pretrained → downloaded official → API |
-| WeatherNext 학습 경계 | 선택된 rollout은 downstream 학습에서 고정 |
+| WeatherNext input | HRES/ERA5 + supplements → 2×6-hour fields, 13 levels, global grid |
+| WeatherNext mode | pretrained frozen / API frozen / explicitly trainable upstream |
+| WeatherNext 학습 경계 | token cache에서 dual-loss autograd와 분리 |
 | Forecast input | 0–15일, 최대 `10×6×12=720` token |
 | Forecast masking | source feature mask → training random mask → effective token/padding mask |
 | GPT state | Structured Output 10차원, 사전 cache |
 | GPT 역할 | History FiLM + WeatherNext Token/Channel Router |
-| GPT 누락 | FiLM과 Router 모두 exact identity |
+| GPT cache key 누락 | 학습 전 coverage 오류 |
+| GPT masked record | FiLM과 Router 모두 exact identity |
 | 분포 출력 | day 15–30, 16 query, `36×72=2592` global cells |
 | 경로 출력 | 동아시아 `0–60°N, 100–180°E`, 6시간 간격 20 step |
 | Loss | `λ_dist L_CE + λ_track L_MSE` |
@@ -95,5 +101,5 @@ flowchart TB
 - “fine-tuned”는 checkpoint의 출처이고, 이 downstream model 안에서 WeatherNext를 다시 fine-tune한다는 뜻이 아닙니다.
 - Channel Gate는 GPT context만 사용합니다. WeatherNext token과 GPT context를 함께 사용하는 것은 Token Gate입니다.
 - History encoder는 packed/masked GRU가 아닙니다. 결측값과 mask를 처리한 projection 뒤에 standard GRU가 옵니다.
-- `--gpt-state-dir`이 없으면 GPT adapter module 자체가 생성되지 않습니다. directory가 있지만 record가 누락되거나 all-zero mask이면 module은 존재하되 identity로 동작합니다.
+- `--gpt-state-dir`이 없으면 GPT adapter module 자체가 생성되지 않습니다. directory가 있으면 모든 token key의 cache 존재를 먼저 검사하고, 존재하지만 all-zero mask인 record만 identity로 동작합니다.
 - 두 loss 모두 Router에 gradient를 전달합니다. 분포 loss는 forecast memory와 fusion query 경로를, track loss는 forecast CLS와 fusion 경로를 사용합니다.

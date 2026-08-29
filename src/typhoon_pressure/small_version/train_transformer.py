@@ -24,7 +24,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--integrated", required=True)
     parser.add_argument("--distribution", required=True)
     parser.add_argument("--weathernext-token-dir", required=True)
-    parser.add_argument("--gpt-state-dir", help="Optional cache produced by build-gpt-state-cache")
+    parser.add_argument(
+        "--gpt-state-dir",
+        help="Enable GPT Router with cache produced by build-gpt-state-cache",
+    )
+    parser.add_argument(
+        "--require-valid-gpt-states",
+        action="store_true",
+        help="Fail when any cached GPT record is masked due to an API failure",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--history", type=int, default=8)
@@ -66,7 +74,13 @@ def main(argv: list[str] | None = None) -> int:
         from .gpt_state import DirectoryGPTStateStore
 
         gpt_state_store = DirectoryGPTStateStore(args.gpt_state_dir)
+        coverage = gpt_state_store.validate_coverage(
+            store.files.keys(), require_valid=args.require_valid_gpt_states
+        )
+        print({"gpt_router": "enabled", "gpt_cache_coverage": coverage})
         gpt_state_dim = gpt_state_store.state_dim
+    else:
+        print({"gpt_router": "disabled", "reason": "--gpt-state-dir not supplied"})
     transformer_config = TransformerConfig(
         forecast_input_dim=forecast_input_dim,
         gpt_state_dim=gpt_state_dim,

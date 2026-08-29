@@ -9,14 +9,14 @@
         ↓
 2. Distribution target 생성
         ↓
-3. WeatherNext source 선택 → frozen rollout → token cache 생성
+3. WeatherNext 입력 병합·검증 → 실행 mode 선택 → token cache 생성
         ↓
 4. GPT state cache 생성 (선택)
         ↓
 5. WeatherNextFusionTransformer 학습
 ```
 
-WeatherNext 자체는 3단계에서 checkpoint를 선택한 뒤 frozen 상태로 rollout만 수행합니다. 실제 optimizer 학습은 5단계의 WeatherNextFusionTransformer에서 수행됩니다.
+기본 `--execution-mode pretrained`에서는 WeatherNext가 frozen inference로 동작합니다. `api`는 원격 inference이며 역시 frozen입니다. WeatherNext 자체 학습은 명시적인 `trainable` mode와 사용자 제공 factory가 있을 때만 별도로 실행됩니다. 후단 dual-loss optimizer는 항상 5단계의 WeatherNextFusionTransformer를 학습합니다.
 
 ---
 
@@ -91,33 +91,35 @@ L_total
 
 ---
 
-# Step 3. WeatherNext frozen rollout + token cache 생성
+# Step 3. WeatherNext 입력 준비 + 전체 token cache 생성
 
 이 단계가 WeatherNext resolver가 실제 pipeline에 연결되는 부분입니다.
 
-Resolver 우선순위:
+실행 mode:
 
 ```text
-1. fine-tuned checkpoint
-2. local official/pretrained checkpoint
-3. online checkpoint download
-4. API fallback (Python application에서 client 주입 시)
+pretrained: fine-tuned/local official/download checkpoint를 선택하고 frozen inference
+api: --api-client-factory로 주입한 원격 forecast client 사용
+trainable: --trainable-factory가 반환한 WeatherNext model/data로 fit 후 rollout
+auto: 기존 fine-tuned → official → download → API fallback 우선순위
 ```
 
-선택된 WeatherNext weight는 frozen 상태로 사용되며 추가 fine-tuning은 발생하지 않습니다.
+`pretrained`가 기본값이므로 공식 checkpoint를 지정하는 것만으로 WeatherNext가 학습되는 일은 없습니다.
 
 전체 흐름:
 
 ```text
-ERA5 / HRES initial state
+ERA5 / HRES + supplemental fields
         +
 IBTrACS storm state
+        ↓
+WeatherNextInputPreparer
         ↓
 InitialConditionBuilder
         ↓
 WeatherNext Resolver
         ↓
-Frozen WeatherNext
+Selected WeatherNext execution
         ↓
 Rollout
         ↓
@@ -127,6 +129,33 @@ WeatherNext tokenizer
         ↓
 Token .npz + manifest.csv
 ```
+
+## 3-0. 공식 입력 계약 해결
+
+CLI는 기본적으로 입력 준비를 수행합니다. HRES/ERA5 source의 alias와 상대시간을 정규화하고, `t-6h`와 `t` 두 장을 선택한 뒤 다음 계약을 검사합니다.
+
+| 항목 | WeatherNext2 계약 |
+|---|---|
+| 시간 | 6시간 간격 2개 시점 |
+| pressure level | 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000 hPa |
+| grid | 전지구 0.25°, 721×1440 |
+| 3D 변수 | temperature, geopotential, u/v wind, vertical velocity, specific humidity |
+| surface/static | 2m temperature, MSLP, 10m u/v, SST, surface geopotential, land-sea mask |
+| WN2 전용 | 100m u/v wind |
+
+한 source에 없는 SST·정적장·100 m 바람은 반복 가능한 `--supplement-state`로 병합합니다. 결측 물리변수를 임의 생성하지 않으며, 끝까지 없으면 실행 전에 오류가 발생합니다.
+
+```bash
+prepare-weathernext-pipeline \
+  --atmospheric-state data/hres_or_era5.zarr \
+  --supplement-state data/era5_sst_static.zarr \
+  --supplement-state data/hres_100m_wind.zarr \
+  --jobs data/weathernext_jobs.csv \
+  --execution-mode pretrained \
+  --pretrained-checkpoint download/weathernext2.npz
+```
+
+정규 전지구 grid이지만 해상도만 다를 때는 `--regrid`를 명시할 수 있습니다. 지역 grid 또는 불완전한 source를 전지구 자료처럼 외삽하는 용도는 아닙니다. 100 m 바람을 준비하기 어렵고 태풍용 checkpoint를 사용할 경우 `--model-variant WeatherNextCyclones`를 선택하면 해당 두 변수는 요구하지 않습니다.
 
 ## 3-A. Fine-tuned weight가 있는 경우
 
@@ -139,6 +168,7 @@ prepare-weathernext-pipeline \
   --lon 133.0 \
   --pressure-hpa 975 \
   --wind-kt 70 \
+  --execution-mode pretrained \
   --finetuned-checkpoint checkpoints/korea_finetuned.npz \
   --pretrained-checkpoint download/weathernext2.npz \
   --horizon-hours 360 \
@@ -160,6 +190,7 @@ prepare-weathernext-pipeline \
   --lon 133.0 \
   --pressure-hpa 975 \
   --wind-kt 70 \
+  --execution-mode pretrained \
   --pretrained-checkpoint download/weathernext2.npz \
   --horizon-hours 360 \
   --forecast-dir data/weathernext_forecasts \
@@ -179,6 +210,7 @@ prepare-weathernext-pipeline \
   --lon 133.0 \
   --pressure-hpa 975 \
   --wind-kt 70 \
+  --execution-mode pretrained \
   --checkpoint-url "https://storage.googleapis.com/dm_graphcast/weathernext2/params/WeatherNext2_%3C2025_model1.npz" \
   --download-dir download/weathernext \
   --horizon-hours 360 \
@@ -208,11 +240,25 @@ data/
     └── <storm_id>__<init_time_ns>.npz
 ```
 
-### 중요
+## 3-D. 여러 `(storm_id, init_time)`을 한 번에 처리
 
-현재 `prepare-weathernext-pipeline`은 한 개의 `(storm_id, init_time)` sample을 처리합니다.
+`--jobs` CSV/Parquet는 `storm_id, init_time, lat, lon`과 선택적인 `pressure_hpa, wind_kt` 열을 가집니다. Step 1의 integrated dataset을 그대로 전달하면 `--job-history`, `--job-horizon`, `--job-max-highs`로 downstream dataset window를 동일하게 재구성하고, 실제 학습 sample에 해당하는 초기시각만 자동 추출합니다.
 
-따라서 전체 training dataset에 대해서는 각 initialization sample별로 반복 실행하여 `data/weathernext_tokens/manifest.csv`를 충분히 채워야 합니다.
+```bash
+prepare-weathernext-pipeline \
+  --atmospheric-state data/hres_era5_full.zarr \
+  --supplement-state data/weather_supplement.zarr \
+  --jobs data/integrated_typhoon_pressure.parquet \
+  --job-history 8 --job-horizon 20 --job-max-highs 3 \
+  --execution-mode pretrained \
+  --pretrained-checkpoint download/weathernext2.npz \
+  --horizon-hours 360 \
+  --forecast-dir data/weathernext_forecasts \
+  --token-dir data/weathernext_tokens \
+  --on-error continue
+```
+
+모델/checkpoint는 한 번만 load되고 모든 job에 재사용됩니다. 기본 resume mode는 token manifest에 이미 존재하는 key를 건너뜁니다. 다시 만들려면 `--no-resume`을 사용합니다.
 
 ---
 
@@ -250,6 +296,8 @@ WeatherNext token과 GPT state는 동일한 `(storm_id, init_time)` key를 사�
 
 GPT conditioning을 사용하지 않을 경우 Step 4는 건너뛰고 Step 5에서 `--gpt-state-dir` 옵션을 제거하면 됩니다.
 
+GPT Router를 사용할 경우 Step 4는 필수입니다. Step 5 시작 시 WeatherNext token manifest의 모든 key가 GPT cache에도 있는지 검사합니다. API 실패로 mask된 cache까지 금지하려면 `--require-valid-gpt-states`를 추가합니다.
+
 ---
 
 # Step 5. WeatherNext + GPT Fusion Transformer 학습
@@ -282,6 +330,7 @@ train-weathernext-transformer \
   --distribution data/distribution/spatial_distribution.csv \
   --weathernext-token-dir data/weathernext_tokens \
   --gpt-state-dir data/gpt_states \
+  --require-valid-gpt-states \
   --epochs 10 \
   --batch-size 8 \
   --history 8 \
@@ -331,18 +380,13 @@ build-typhoon-distribution-targets \
   --output-dir data/distribution \
   --basins WP
 
-# 3. WeatherNext frozen rollout + token
+# 3. WeatherNext pretrained frozen rollout + all tokens
 prepare-weathernext-pipeline \
-  --atmospheric-state data/weather_initial_state.nc \
-  --storm-id TEST \
-  --init-time 2025-08-01T00:00:00 \
-  --lat 22 \
-  --lon 133 \
-  --pressure-hpa 975 \
-  --finetuned-checkpoint checkpoints/korea_finetuned.npz \
+  --atmospheric-state data/hres_era5_full.zarr \
+  --supplement-state data/weather_supplement.zarr \
+  --jobs data/weathernext_jobs.parquet \
+  --execution-mode pretrained \
   --pretrained-checkpoint download/weathernext2.npz
-
-# Step 3은 training sample별 반복
 
 # 4. GPT state cache
 export OPENAI_API_KEY="YOUR_API_KEY"
@@ -356,6 +400,7 @@ train-weathernext-transformer \
   --distribution data/distribution/spatial_distribution.csv \
   --weathernext-token-dir data/weathernext_tokens \
   --gpt-state-dir data/gpt_states \
+  --require-valid-gpt-states \
   --epochs 10 \
   --batch-size 8 \
   --output checkpoints/weathernext_transformer.pt
@@ -366,6 +411,8 @@ train-weathernext-transformer \
 # Weight와 학습 구조 요약
 
 ```text
+--execution-mode pretrained
+        ↓
 Fine-tuned checkpoint 존재
         ↓ YES
 fine-tuned weight load
@@ -397,3 +444,5 @@ checkpoints/weathernext_transformer.pt
 ```
 
 즉 WeatherNext checkpoint source를 바꾸더라도 후단 training command는 동일하게 유지됩니다.
+
+`--execution-mode trainable`은 이 경계 앞에서 WeatherNext를 별도로 fit하는 선택입니다. token `.npz`로 저장된 뒤에는 autograd가 끊기므로 dual loss가 WeatherNext checkpoint까지 joint backpropagation하지는 않습니다. joint end-to-end fine-tuning이 필요하면 token cache 경계를 제거하는 별도 모델 통합이 필요합니다.

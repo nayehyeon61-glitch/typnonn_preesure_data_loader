@@ -74,7 +74,7 @@ raw history → masked projection → GPT scale/shift → dynamic history → GR
 WeatherNext token → GPT token/channel gates → routed token → Transformer
 ```
 
-API 실패·거절·미생성 state는 `values=0, mask=0`으로 저장됩니다. 이 경우 scale과 shift는 0, 두 Router gate는 1이 되어 history와 WeatherNext token 모두 exact identity 경로로 작동합니다. `--gpt-state-dir` 자체를 생략하면 두 GPT adapter module은 생성되지 않습니다.
+API 실패·거절 state는 `values=0, mask=0`으로 저장됩니다. 이 경우 scale과 shift는 0, 두 Router gate는 1이 되어 history와 WeatherNext token 모두 exact identity 경로로 작동합니다. `--gpt-state-dir`을 지정하면 WeatherNext token key 전체의 cache coverage를 학습 전에 검사하므로 미생성 key는 오류입니다. option 자체를 생략하면 두 GPT adapter module은 생성되지 않습니다.
 
 ```bash
 pip install -e '.[io,small,gpt]'
@@ -122,6 +122,7 @@ train-weathernext-transformer \
   --distribution data/distribution/spatial_distribution.csv \
   --weathernext-token-dir data/weathernext_tokens \
   --gpt-state-dir data/gpt_states \
+  --require-valid-gpt-states \
   --input-mask-probability 0.15 \
   --output checkpoints/weathernext_transformer.pt
 ```

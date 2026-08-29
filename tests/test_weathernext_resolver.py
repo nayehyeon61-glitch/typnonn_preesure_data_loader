@@ -154,3 +154,48 @@ def test_no_source_raises():
                 allow_api_fallback=False,
             )
         )
+
+
+def test_explicit_api_mode_does_not_consider_checkpoints(monkeypatch):
+    class FakeAPIRunner(FakeRunner):
+        pass
+
+    seen = []
+    monkeypatch.setattr(
+        "typhoon_pressure.weathernext_resolver.build_weathernext_runner",
+        lambda config, api_client=None, **kwargs: seen.append(config.backend_type.value) or FakeAPIRunner(),
+    )
+    resolved = resolve_weathernext(
+        WeatherNextSelectionConfig(
+            execution_mode="api",
+            api_provider="test-provider",
+            pretrained_checkpoint="/does/not/matter.npz",
+        ),
+        api_client=FakeAPI(),
+    )
+    assert seen == ["api"]
+    assert resolved.origin is CheckpointOrigin.API
+    assert resolved.frozen
+
+
+def test_explicit_trainable_mode_fits_once(monkeypatch):
+    class FakeTrainableRunner(FakeRunner):
+        def __init__(self):
+            self.fit_calls = 0
+
+        def fit(self):
+            self.fit_calls += 1
+
+    runner = FakeTrainableRunner()
+    monkeypatch.setattr(
+        "typhoon_pressure.weathernext_resolver.build_weathernext_runner",
+        lambda *args, **kwargs: runner,
+    )
+    resolved = resolve_weathernext(
+        WeatherNextSelectionConfig(execution_mode="trainable"),
+        trainable_model=object(),
+        training_data=object(),
+    )
+    assert runner.fit_calls == 1
+    assert resolved.origin is CheckpointOrigin.TRAINED
+    assert not resolved.frozen
