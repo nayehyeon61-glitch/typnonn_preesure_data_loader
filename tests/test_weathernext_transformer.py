@@ -78,10 +78,12 @@ def test_weathernext_output_reaches_masked_transformer(tmp_path):
     losses = DualObjectiveLoss()(outputs, batch)
     assert outputs["distribution_logits"].shape == (1, 2, 4)
     assert outputs["gpt_history_conditioning_fraction"].item() == 0.0
+    assert outputs["gpt_forecast_router_active_fraction"].item() == 0.0
+    assert torch.allclose(outputs["gpt_forecast_token_gate"], torch.ones_like(outputs["gpt_forecast_token_gate"]))
+    assert torch.allclose(outputs["gpt_forecast_channel_gate"], torch.ones_like(outputs["gpt_forecast_channel_gate"]))
     assert torch.isfinite(losses["loss"])
     losses["loss"].backward()
 
-    # Even a fully missing WeatherNext input remains numerically valid through CLS.
     model.eval()
     unconditioned_outputs = model(
         batch["history"], batch["history_mask"], batch["forecast_values"],
@@ -95,12 +97,24 @@ def test_weathernext_output_reaches_masked_transformer(tmp_path):
         batch["forecast_positions"], gpt_values, gpt_mask,
     )
     assert torch.isfinite(masked_outputs["distribution_logits"]).all()
+
     conditioned_outputs = model(
         batch["history"], batch["history_mask"], batch["forecast_values"],
         batch["forecast_feature_mask"], batch["forecast_token_mask"],
         batch["forecast_positions"], torch.ones_like(gpt_values), torch.ones_like(gpt_mask),
     )
     assert conditioned_outputs["gpt_history_conditioning_fraction"].item() == 1.0
+    assert conditioned_outputs["gpt_forecast_router_active_fraction"].item() == 1.0
+    # Router starts as an identity transformation; subsequent optimizer steps can
+    # learn non-uniform token/channel gates from the GPT semantic state.
+    assert torch.allclose(
+        conditioned_outputs["gpt_forecast_token_gate"],
+        torch.ones_like(conditioned_outputs["gpt_forecast_token_gate"]),
+    )
+    assert torch.allclose(
+        conditioned_outputs["gpt_forecast_channel_gate"],
+        torch.ones_like(conditioned_outputs["gpt_forecast_channel_gate"]),
+    )
     assert not torch.allclose(
         conditioned_outputs["distribution_logits"], unconditioned_outputs["distribution_logits"]
     )
