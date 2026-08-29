@@ -421,6 +421,8 @@ API 실패나 state cache 누락은 임의 값으로 대체하지 않습니다. 
 
 ## 6. Utility metrics와 IBTrACS evaluation
 
+WeatherNext 실행 방식 선택은 [`weathernext/README.md`](weathernext/README.md), IBTrACS 기준 backend별 평가는 [`evaluation/README.md`](evaluation/README.md)에 정리했습니다.
+
 재사용 metric은 [`utility/`](utility/README.md), 평가 실행 구조는 [`evaluation/`](evaluation/README.md)에 정리했습니다. 실제 Python package는 각각 `src/typhoon_pressure/utility/`, `src/typhoon_pressure/evaluation/`에 있습니다.
 
 현재 evaluation은 예측 결과를 **IBTrACS 관측과만** `storm_id + absolute time`으로 결합합니다.
