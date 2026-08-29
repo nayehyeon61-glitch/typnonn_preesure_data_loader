@@ -112,10 +112,10 @@ prepare-weathernext-pipeline \
   --pressure-hpa 975 --wind-kt 70 \
   --finetuned-checkpoint checkpoints/korea_finetuned.npz \
   --pretrained-checkpoint download/weathernext2.npz \
-  --checkpoint-url https://example.org/weathernext2.npz
+  --checkpoint-url "https://storage.googleapis.com/dm_graphcast/weathernext2/params/WeatherNext2_%3C2025_model1.npz"
 ```
 
-`--checkpoint-url`은 local fine-tuned/pretrained checkpoint가 없을 때만 사용됩니다. 파일은 기본적으로 `download/weathernext/<model>/<release>/`에 cache됩니다. 인증이 필요한 Google Cloud/사설 저장소는 provider별 downloader를 application에서 `resolve_weathernext(..., downloader=...)`로 주입해야 합니다.
+`--checkpoint-url`은 local fine-tuned/pretrained checkpoint가 없을 때만 사용됩니다. 위 URL은 Google DeepMind의 공개 `dm_graphcast` bucket에 있는 `WeatherNext2_<2025_model1.npz`이며, `%3C`는 `<`의 URL encoding입니다. 파일은 기본적으로 `download/weathernext/<model>/<release>/`에 cache됩니다. 운영용 ensemble의 다른 member를 사용하려면 파일명의 `model1`을 `model2`, `model3`, `model4`로 바꿀 수 있습니다. 인증이 필요한 Google Cloud/사설 저장소는 provider별 downloader를 application에서 `resolve_weathernext(..., downloader=...)`로 주입해야 합니다.
 
 ## GPT state와 후단 학습
 

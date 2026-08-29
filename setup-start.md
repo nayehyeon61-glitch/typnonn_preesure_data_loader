@@ -168,7 +168,7 @@ prepare-weathernext-pipeline \
 
 ## 3-C. Local checkpoint가 없고 online checkpoint를 받을 경우
 
-공개 checkpoint URL이 있는 경우:
+Google DeepMind가 공개한 `WeatherNext2_<2025` model 1 checkpoint를 사용하는 경우:
 
 ```bash
 prepare-weathernext-pipeline \
@@ -179,14 +179,22 @@ prepare-weathernext-pipeline \
   --lon 133.0 \
   --pressure-hpa 975 \
   --wind-kt 70 \
-  --checkpoint-url "https://.../weathernext2.npz" \
+  --checkpoint-url "https://storage.googleapis.com/dm_graphcast/weathernext2/params/WeatherNext2_%3C2025_model1.npz" \
   --download-dir download/weathernext \
   --horizon-hours 360 \
   --forecast-dir data/weathernext_forecasts \
   --token-dir data/weathernext_tokens
 ```
 
-다운로드된 checkpoint는 cache되므로 이후 실행에서는 local weight처럼 재사용됩니다.
+다운로드된 checkpoint는 cache되므로 이후 실행에서는 local weight처럼 재사용됩니다. URL의 `%3C`는 공식 파일명에 포함된 `<` 문자를 URL encoding한 것입니다. 운영용 ensemble은 `model1`부터 `model4`까지 공개되어 있으며, 위 예제는 단일 rollout을 위해 `model1`을 선택합니다.
+
+공식 WN2 weight는 약 735 MB이고 0.25° full model이므로 충분한 accelerator memory가 필요합니다. 경량 실행 검증이 먼저 필요하면 공식 Mini checkpoint를 사용할 수 있습니다.
+
+```text
+https://storage.googleapis.com/dm_graphcast/weathernext2/params/WeatherNextCyclones_Mini_%3C2024.npz
+```
+
+Mini checkpoint를 사용할 때는 checkpoint 파일만 바꾸는 것이 아니라 해당 Mini model configuration과 입력 해상도도 함께 선택해야 하므로, 현재 기본값인 `--model-variant WeatherNext2`와 그대로 혼용하지 마십시오.
 
 출력 예시:
 
