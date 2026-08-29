@@ -79,3 +79,32 @@ def test_auto_initial_condition_corrects_displaced_vortex():
     request = make_weathernext_request(condition, horizon_hours=360)
     assert request.tracker_seed["storm_id"] == "TEST"
     assert request.horizon_hours == 360
+
+
+def test_initial_condition_can_preserve_two_weather_history_steps():
+    times = pd.date_range("2025-07-31T18:00:00", periods=2, freq="6h")
+    lat = np.linspace(10, 30, 21)
+    lon = np.linspace(120, 150, 31)
+    yy, xx = np.meshgrid(lat, lon, indexing="ij")
+    field = 1010 - 20 * np.exp(-((yy - 20) ** 2 + (xx - 130) ** 2) / 8)
+    state = xr.Dataset(
+        {"msl": (("time", "latitude", "longitude"), np.stack((field, field)) * 100)},
+        coords={"time": times, "latitude": lat, "longitude": lon},
+    )
+    storm = StormObservation(
+        storm_id="TEST",
+        time=times[-1],
+        lat=20,
+        lon=130,
+        pressure_hpa=990,
+    )
+    condition = InitialConditionBuilder(
+        mode="tracker_seed",
+        history_steps=2,
+    ).build(state, storm)
+    assert condition.atmospheric_state.sizes["time"] == 2
+    assert condition.metadata()["input_history_steps"] == 2
+    assert pd.Timedelta(
+        condition.atmospheric_state.time.values[-1]
+        - condition.atmospheric_state.time.values[-2]
+    ) == pd.Timedelta("6h")

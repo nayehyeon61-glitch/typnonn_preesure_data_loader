@@ -16,6 +16,9 @@ small = [
   "typhoon-distribution @ git+https://github.com/nayehyeon61-glitch/typnoon-disribution.git@83223fd4c7703ec75c4a60d5cab1cfba59aacc7a",
 ]
 gpt = ["openai>=2.0", "pydantic>=2.0"]
+weathernext = [
+  "weathernext @ git+https://github.com/google-deepmind/weathernext.git@v0.3.0",
+]
 
 [project.scripts]
 build-typhoon-pressure-data = "typhoon_pressure.cli:main"

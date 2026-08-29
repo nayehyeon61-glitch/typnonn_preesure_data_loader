@@ -66,15 +66,66 @@ forecast = run_weathernext(runner, request)
 ```python
 config = WeatherNextBackendConfig(
     backend="pretrained",
-    model_id="WeatherNext2_<2025",
+    model_id="WeatherNext2_finetuned_35N45N",
+    model_variant="WeatherNext2",
     release="v0.3.0",
-    checkpoint="WeatherNext2_<2025_model1.npz",
+    checkpoint="/weights/weather-me-fine_tune_weight.npz",
 )
-runner = build_weathernext_runner(config, pretrained_model=loaded_wn2)
+runner = build_weathernext_runner(config)
 forecast = run_weathernext(runner, request)
 ```
 
-운영 pretrained WN2는 HRES 초기조건에 맞춰져 있으므로 ERA5를 사용할 때는 별도 검증이 필요합니다.
+`build_weathernext_runner()`는 checkpoint를 공식 `fgn.CheckPoint`로 읽고
+`OfficialWeatherNextRunner`를 자동 생성합니다. 이 경로에는 `fit()`, optimizer,
+gradient update가 없으므로 rollout 중 추가 학습이 일어나지 않습니다. 파인튜닝된
+파라미터는 읽기 전용으로 유지되며 그대로 추론에 사용됩니다.
+
+파인튜닝 저장소에서 함께 생성한
+`weather-me-fine_tune_weight.metadata.json`을 가중치 옆에 두면 model 종류와
+release를 자동 검증합니다.
+
+```text
+/weights/
+├── weather-me-fine_tune_weight.npz
+└── weather-me-fine_tune_weight.metadata.json
+```
+
+지원되는 model variant와 alias는 다음과 같습니다.
+
+| `model_variant` | alias | 해상도 | 호환 가중치 |
+|---|---|---:|---|
+| `WeatherNext2` | `weather-next`, `weather-next2` | 0.25° | WeatherNext2에서 파인튜닝한 weight |
+| `WeatherNextCyclones` | `cyclone`, `cyclones` | 0.25° | WeatherNextCyclones weight |
+| `WeatherNextCyclones_Mini` | `mini`, `weather-next-mini` | 1.0° | Mini weight |
+
+서로 다른 모델의 가중치는 교환할 수 없습니다. 예를 들어 Mini에서 만든 weight를
+0.25° WeatherNext2 config에 로드하면 안 됩니다. GraphCast와 GenCast도 checkpoint
+구조가 다르므로 이 WN2 fine-tuned weight의 대상이 아닙니다.
+
+공식 WN2의 12시간 input 계약을 충족하려면 6시간 간격의 대기장 두 개를
+초기조건에 보존해야 합니다.
+
+```python
+builder = InitialConditionBuilder(
+    mode="auto",
+    history_steps=2,
+)
+condition = builder.build(hres_or_era5_history, storm)
+request = make_weathernext_request(condition, horizon_hours=360)
+```
+
+전체 WN2 입력 변수, 13개 pressure level, 전 지구 격자가 필요합니다. 35–45°N에
+대해 파인튜닝한 weight도 입력은 전 지구로 유지합니다. 운영 pretrained WN2는
+HRES 초기조건에 맞춰져 있으므로 ERA5를 사용할 때는 별도 검증이 필요합니다.
+
+설치:
+
+```bash
+pip install -e '.[weathernext]'
+```
+
+GPU에서는 실행 환경에 맞는 JAX CUDA wheel을 별도로 설치해야 합니다. 첫 rollout은
+JAX compile 때문에 오래 걸릴 수 있습니다.
 
 ### 3. API 또는 managed forecast feed
 

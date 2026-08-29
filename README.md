@@ -220,41 +220,33 @@ corrected_MSLP
 
 ### WeatherNext runner 연결
 
-이 패키지는 대용량 JAX/TPU 의존성을 기본 loader에 강제로 설치하지 않도록 WN2 실행부를 protocol로 분리합니다.
+이 패키지는 대용량 JAX/TPU 의존성을 기본 loader에 강제로 설치하지 않도록 WN2
+실행부를 optional dependency로 분리합니다. 파인튜닝 저장소에서 생성한
+`weather-me-fine_tune_weight.npz`는 공식 checkpoint 형식으로 직접 로드할 수
+있습니다.
 
 ```python
-import xarray as xr
-
+from typhoon_pressure import WeatherNextBackendConfig, build_weathernext_runner
 from typhoon_pressure.weathernext_adapter import run_weathernext
 
-
-class MyWeatherNextRunner:
-    def __init__(self, model, checkpoint):
-        self.model = model
-        self.checkpoint = checkpoint
-
-    def rollout(
-        self,
-        initial_state: xr.Dataset,
-        horizon_hours: int,
-    ) -> xr.Dataset:
-        # 이 내부에서 version-pinned Google WN2/JAX 코드를 호출합니다.
-        return self.model.rollout(
-            initial_state=initial_state,
-            checkpoint=self.checkpoint,
-            steps=horizon_hours // 6,
-        )
-
-
-runner = MyWeatherNextRunner(model, checkpoint)
+config = WeatherNextBackendConfig(
+    backend="pretrained",
+    model_id="regional-wn2-35N45N",
+    model_variant="WeatherNext2",
+    release="v0.3.0",
+    checkpoint="/weights/weather-me-fine_tune_weight.npz",
+)
+runner = build_weathernext_runner(config)
 forecast = run_weathernext(runner, request)
 ```
 
-실제 연구에서는 WN2 패키지 버전을 고정하는 것을 권장합니다.
+이 runner에는 `fit()`과 optimizer가 없으며 checkpoint를 읽기 전용으로 로드합니다.
+따라서 rollout 과정에서 추가 학습이 발생하거나 파인튜닝 weight가 사전학습
+weight로 교체되지 않습니다. 공식 WN2가 요구하는 두 개의 6시간 입력장을
+보존하려면 초기조건 builder에 `history_steps=2`를 지정합니다.
 
 ```bash
-pip install \
-  git+https://github.com/google-deepmind/weathernext.git@v0.3.0
+pip install -e '.[weathernext]'
 ```
 
 공개 운영 WN2 가중치는 HRES 초기조건에 맞춰져 있으므로 실제 추론에는 HRES 사용을 우선 권장합니다. ERA5는 과거 실험, 전처리 검증과 보정 ablation에 사용할 수 있습니다.

@@ -37,6 +37,7 @@ class WeatherNextBackendConfig:
     model_id: str = "WeatherNext2_<2025"
     release: str = "v0.3.0"
     checkpoint: str | None = None
+    model_variant: str | None = None
     api_provider: str | None = None
     training_kwargs: dict[str, Any] = field(default_factory=dict)
 
@@ -66,6 +67,7 @@ class _RunnerMetadata:
         return {
             "weathernext_backend": self.config.backend_type.value,
             "weathernext_model_id": self.config.model_id,
+            "weathernext_model_variant": self.config.model_variant,
             "weathernext_release": self.config.release,
             "weathernext_checkpoint": self.config.checkpoint,
             "weathernext_api_provider": self.config.api_provider,
@@ -127,7 +129,13 @@ def build_weathernext_runner(
         return TrainableWeatherNextRunner(config, trainable_model, training_data)
     if backend is WeatherNextBackend.PRETRAINED:
         if pretrained_model is None:
-            raise ValueError("pretrained backend requires an initialized pretrained_model")
+            from .weathernext_official import OfficialWeatherNextRunner
+
+            pretrained_model = OfficialWeatherNextRunner(
+                model_name=config.model_variant or config.model_id,
+                checkpoint_path=config.checkpoint,
+                release=config.release,
+            )
         return PretrainedWeatherNextRunner(config, pretrained_model)
     if api_client is None:
         raise ValueError("api backend requires api_client")

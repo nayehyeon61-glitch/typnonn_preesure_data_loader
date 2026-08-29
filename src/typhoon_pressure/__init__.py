@@ -14,6 +14,7 @@ from .weathernext_backends import (
     WeatherNextBackendConfig,
     build_weathernext_runner,
 )
+from .weathernext_official import OfficialWeatherNextRunner
 
 __all__ = [
     "HighPressureConfig",
@@ -24,6 +25,7 @@ __all__ = [
     "TyphoonPressureDataset",
     "WeatherInitialCondition",
     "WeatherNextRequest",
+    "OfficialWeatherNextRunner",
     "build_weathernext_runner",
     "WeatherNextBackendConfig",
     "WeatherNextBackend",

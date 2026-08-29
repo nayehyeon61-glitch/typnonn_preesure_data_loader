@@ -80,10 +80,16 @@ class WeatherInitialCondition:
             "model_center_lat": None if center is None else center.lat,
             "model_center_lon": None if center is None else center.lon,
             "model_center_pressure_hpa": None if center is None else center.pressure_hpa,
+            "input_history_steps": self.atmospheric_state.sizes.get("time", 1),
         }
 
 
-def _single_time_state(state: xr.Dataset, time: pd.Timestamp, tolerance: str) -> xr.Dataset:
+def _time_history_state(
+    state: xr.Dataset,
+    time: pd.Timestamp,
+    tolerance: str,
+    history_steps: int,
+) -> xr.Dataset:
     rename = {
         old: new
         for old, new in {
@@ -94,8 +100,20 @@ def _single_time_state(state: xr.Dataset, time: pd.Timestamp, tolerance: str) ->
     }
     state = state.rename(rename)
     if "time" not in state.dims:
+        if history_steps != 1:
+            raise ValueError("Multiple WeatherNext history steps require a time dimension")
         return state.copy(deep=True)
-    selected = state.sel(time=np.datetime64(time), method="nearest", tolerance=pd.Timedelta(tolerance))
+    nearest = state.sel(
+        time=np.datetime64(time), method="nearest", tolerance=pd.Timedelta(tolerance)
+    ).time.values
+    eligible = state.sel(time=slice(None, nearest))
+    if eligible.sizes["time"] < history_steps:
+        raise ValueError(
+            f"Initial atmospheric state needs {history_steps} history steps at or before {time}"
+        )
+    selected = eligible.isel(time=slice(-history_steps, None))
+    if history_steps == 1:
+        selected = selected.isel(time=0, drop=True)
     return selected.copy(deep=True)
 
 
@@ -197,16 +215,26 @@ class InitialConditionBuilder:
         mode: InitializationMode = "auto",
         config: CorrectionConfig = CorrectionConfig(),
         time_tolerance: str = "3h",
+        history_steps: int = 1,
     ):
         if mode not in {"tracker_seed", "vortex_correction", "auto"}:
             raise ValueError(f"Unknown initialization mode: {mode}")
         self.mode = mode
         self.config = config
         self.time_tolerance = time_tolerance
+        if history_steps < 1:
+            raise ValueError("history_steps must be at least 1")
+        self.history_steps = history_steps
 
     def build(self, atmospheric_state: xr.Dataset, storm: StormObservation) -> WeatherInitialCondition:
-        state = _single_time_state(atmospheric_state, storm.time, self.time_tolerance)
-        center = detect_model_storm_center(state, storm, self.config)
+        state = _time_history_state(
+            atmospheric_state,
+            storm.time,
+            self.time_tolerance,
+            self.history_steps,
+        )
+        current_state = state.isel(time=-1, drop=True) if "time" in state.dims else state
+        center = detect_model_storm_center(current_state, storm, self.config)
         position_error = None
         pressure_error = None
         if center is not None:
@@ -223,7 +251,18 @@ class InitialConditionBuilder:
                 correct |= abs(pressure_error) > self.config.pressure_threshold_hpa
         correct &= center is not None and storm.pressure_hpa is not None
 
-        corrected = correct_mslp_vortex(state, storm, center, self.config) if correct else state
+        corrected = state
+        if correct:
+            corrected_current = correct_mslp_vortex(
+                current_state, storm, center, self.config
+            )
+            if "time" in state.dims:
+                corrected = state.copy(deep=True)
+                corrected["mslp"].loc[{"time": state.time.values[-1]}] = (
+                    corrected_current["mslp"]
+                )
+            else:
+                corrected = corrected_current
         return WeatherInitialCondition(
             atmospheric_state=corrected,
             storm=storm,

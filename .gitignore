@@ -6,3 +6,6 @@ __pycache__/
 data/
 checkpoints/
 *.pt
+weather-me-fine_tune_weight*.npz
+weather-me-fine_tune_weight*.metrics.json
+weather-me-fine_tune_weight*.metadata.json

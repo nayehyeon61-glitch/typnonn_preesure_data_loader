@@ -13,7 +13,11 @@ from typhoon_pressure.weathernext_backends import (
 def _state():
     return xr.Dataset(
         {"msl": (("time", "latitude", "longitude"), np.ones((1, 2, 2)))},
-        coords={"time": [pd.Timestamp("2025-01-01")], "latitude": [0, 1], "longitude": [130, 131]},
+        coords={
+            "time": [pd.Timestamp("2025-01-01")],
+            "latitude": [0, 1],
+            "longitude": [130, 131],
+        },
     )
 
 
@@ -70,6 +74,32 @@ def test_pretrained_backend_requires_checkpoint_and_records_release():
     forecast = run_weathernext(runner, _request())
     assert forecast.attrs["weathernext_release"] == "v0.3.0"
     assert forecast.attrs["weathernext_checkpoint"] == "WeatherNext2_<2025_model1.npz"
+
+
+def test_pretrained_backend_can_build_read_only_official_runner(monkeypatch):
+    created = {}
+
+    class FakeOfficialModel(FakeModel):
+        def __init__(self, **kwargs):
+            super().__init__()
+            created.update(kwargs)
+
+    monkeypatch.setattr(
+        "typhoon_pressure.weathernext_official.OfficialWeatherNextRunner",
+        FakeOfficialModel,
+    )
+    runner = build_weathernext_runner(
+        WeatherNextBackendConfig(
+            "pretrained",
+            model_id="regional-wn2",
+            model_variant="WeatherNext2",
+            checkpoint="/weights/weather-me-fine_tune_weight.npz",
+        )
+    )
+    forecast = run_weathernext(runner, _request())
+    assert created["model_name"] == "WeatherNext2"
+    assert created["checkpoint_path"] == "/weights/weather-me-fine_tune_weight.npz"
+    assert forecast.attrs["weathernext_backend"] == "pretrained"
 
 
 def test_api_backend_calls_injected_client_and_records_provider():
