@@ -327,6 +327,8 @@ pytest
 
 ## 5. Small version: 두 가지 loss 학습
 
+전체 시스템 구조도는 [`struct-picture/`](struct-picture/README.md)에서 단계별 Mermaid 그림으로 확인할 수 있습니다.
+
 `src/typhoon_pressure/small_version/`은 [typnoon-disribution](https://github.com/nayehyeon61-glitch/typnoon-disribution)이 생성한 지구 격자분포와 이 저장소의 태풍·기압 history를 연결합니다.
 
 ```mermaid
