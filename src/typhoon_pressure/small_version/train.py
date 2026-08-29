@@ -55,6 +55,9 @@ def train_epoch(model, loader, optimizer, criterion, device: torch.device) -> di
             "effective_forecast_token_fraction",
             "effective_forecast_feature_fraction",
             "gpt_history_conditioning_fraction",
+            "gpt_forecast_router_active_fraction",
+            "gpt_forecast_token_gate_mean",
+            "gpt_forecast_channel_gate_mean",
         ):
             if metric in outputs:
                 losses[metric] = outputs[metric]
