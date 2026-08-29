@@ -30,6 +30,7 @@ class IBTrACSEvaluationResult:
     overall: dict[str, int | float | None]
     by_lead: pd.DataFrame
     by_storm: pd.DataFrame
+    by_backend: pd.DataFrame
 
 
 def _utc_naive(values) -> pd.Series:
@@ -152,6 +153,7 @@ def evaluate_ibtracs_predictions(
         overall=_summary(matched),
         by_lead=_group_metrics(matched, "lead_hours"),
         by_storm=_group_metrics(matched, "storm_id"),
+        by_backend=_group_metrics(matched, "weathernext_backend"),
     )
 
 
@@ -169,6 +171,8 @@ def write_ibtracs_evaluation(result: IBTrACSEvaluationResult, output_dir: str | 
     result.by_storm.to_csv(output / "metrics_by_storm.csv", index=False)
     if not result.by_lead.empty:
         result.by_lead.to_csv(output / "metrics_by_lead.csv", index=False)
+    if not result.by_backend.empty:
+        result.by_backend.to_csv(output / "metrics_by_backend.csv", index=False)
     with (output / "metrics_overall.json").open("w", encoding="utf-8") as handle:
         json.dump(_json_safe(result.overall), handle, ensure_ascii=False, indent=2, allow_nan=False)
 
@@ -189,9 +193,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--start")
     parser.add_argument("--end")
     parser.add_argument("--east-asia-only", action="store_true")
+    parser.add_argument(
+        "--weathernext-backend",
+        choices=["trainable", "pretrained", "api"],
+        help="Attach backend provenance when the prediction table does not contain it",
+    )
     args = parser.parse_args(argv)
 
     predictions = _read_table(args.predictions)
+    if args.weathernext_backend:
+        if "weathernext_backend" in predictions:
+            existing = set(predictions["weathernext_backend"].dropna().astype(str))
+            if existing and existing != {args.weathernext_backend}:
+                raise ValueError("CLI backend conflicts with prediction table provenance")
+        predictions["weathernext_backend"] = args.weathernext_backend
     observations = load_ibtracs(args.ibtracs, IBTrACSConfig(
         basin=args.basin or None, agency=args.agency, start=args.start, end=args.end
     ))
