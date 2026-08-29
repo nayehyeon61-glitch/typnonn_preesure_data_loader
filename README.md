@@ -419,6 +419,23 @@ API 실패나 state cache 누락은 임의 값으로 대체하지 않습니다. 
 
 자세한 데이터 계약과 설계 근거는 [`small_version/README.md`](src/typhoon_pressure/small_version/README.md)에 정리했습니다.
 
+## 6. Utility metrics와 IBTrACS evaluation
+
+재사용 metric은 [`utility/`](utility/README.md), 평가 실행 구조는 [`evaluation/`](evaluation/README.md)에 정리했습니다. 실제 Python package는 각각 `src/typhoon_pressure/utility/`, `src/typhoon_pressure/evaluation/`에 있습니다.
+
+현재 evaluation은 예측 결과를 **IBTrACS 관측과만** `storm_id + absolute time`으로 결합합니다.
+
+```bash
+evaluate-ibtracs-predictions \
+  --predictions data/predictions.csv \
+  --ibtracs data/IBTrACS.ALL.v04r01.csv \
+  --basin WP \
+  --agency TOKYO \
+  --output-dir evaluation/ibtracs
+```
+
+기본 track metric은 great-circle mean error, RMSE, median, 90 percentile과 maximum이며, 예측 파일에 기압·풍속 열이 있으면 bias, MAE, RMSE도 계산합니다. `lead_hours`가 있으면 lead-time별 결과를 추가로 생성합니다.
+
 ## 중요한 설계 조건
 
 - IBTrACS CSV의 두 번째 행은 단위 행이므로 자동으로 건너뜁니다.
