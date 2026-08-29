@@ -65,25 +65,42 @@ def test_weathernext_output_reaches_masked_transformer(tmp_path):
         for key, value in sample.items()
     }
     model = WeatherNextFusionTransformer(model_config, TransformerConfig(
-        forecast_input_dim=4, model_dim=16, num_heads=4, num_layers=1,
+        forecast_input_dim=4, gpt_state_dim=10, model_dim=16, num_heads=4, num_layers=1,
         feedforward_dim=32, input_mask_probability=0.5,
     ))
+    gpt_values = torch.zeros((1, 10), dtype=torch.float32)
+    gpt_mask = torch.zeros_like(gpt_values)
     outputs = model(
         batch["history"], batch["history_mask"], batch["forecast_values"],
         batch["forecast_feature_mask"], batch["forecast_token_mask"],
-        batch["forecast_positions"],
+        batch["forecast_positions"], gpt_values, gpt_mask,
     )
     losses = DualObjectiveLoss()(outputs, batch)
     assert outputs["distribution_logits"].shape == (1, 2, 4)
+    assert outputs["gpt_history_conditioning_fraction"].item() == 0.0
     assert torch.isfinite(losses["loss"])
     losses["loss"].backward()
 
     # Even a fully missing WeatherNext input remains numerically valid through CLS.
     model.eval()
+    unconditioned_outputs = model(
+        batch["history"], batch["history_mask"], batch["forecast_values"],
+        batch["forecast_feature_mask"], batch["forecast_token_mask"],
+        batch["forecast_positions"], gpt_values, gpt_mask,
+    )
     masked_outputs = model(
         batch["history"], batch["history_mask"], batch["forecast_values"],
         torch.zeros_like(batch["forecast_feature_mask"]),
         torch.zeros_like(batch["forecast_token_mask"]),
-        batch["forecast_positions"],
+        batch["forecast_positions"], gpt_values, gpt_mask,
     )
     assert torch.isfinite(masked_outputs["distribution_logits"]).all()
+    conditioned_outputs = model(
+        batch["history"], batch["history_mask"], batch["forecast_values"],
+        batch["forecast_feature_mask"], batch["forecast_token_mask"],
+        batch["forecast_positions"], torch.ones_like(gpt_values), torch.ones_like(gpt_mask),
+    )
+    assert conditioned_outputs["gpt_history_conditioning_fraction"].item() == 1.0
+    assert not torch.allclose(
+        conditioned_outputs["distribution_logits"], unconditioned_outputs["distribution_logits"]
+    )

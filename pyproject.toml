@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "typhoon-pressure-data-loader"
-version = "0.3.0"
+version = "0.4.0"
 description = "Join IBTrACS typhoon tracks with surrounding ERA5 high-pressure centres"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24", "pandas>=2", "scipy>=1.10", "xarray>=2023.1", "torch>=2"]
@@ -15,6 +15,7 @@ test = ["pytest>=7"]
 small = [
   "typhoon-distribution @ git+https://github.com/nayehyeon61-glitch/typnoon-disribution.git@83223fd4c7703ec75c4a60d5cab1cfba59aacc7a",
 ]
+gpt = ["openai>=2.0", "pydantic>=2.0"]
 
 [project.scripts]
 build-typhoon-pressure-data = "typhoon_pressure.cli:main"
@@ -22,6 +23,7 @@ build-typhoon-distribution-targets = "typhoon_pressure.small_version.prepare_dis
 train-small-typhoon-model = "typhoon_pressure.small_version.train:main"
 tokenize-weathernext-output = "typhoon_pressure.small_version.tokenize_weathernext:main"
 train-weathernext-transformer = "typhoon_pressure.small_version.train_transformer:main"
+build-gpt-state-cache = "typhoon_pressure.small_version.build_gpt_state_cache:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

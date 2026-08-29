@@ -9,7 +9,11 @@ typnoon-disribution
                               v
 WeatherNext 0-15 day xarray --> masked spatiotemporal tokens
                                           |
-Pressure Data Loader history --> GRU + Transformer fusion
+Pressure Data Loader history --> GPT Structured Output
+                                  |
+                         GPT-conditioned dynamic history
+                                  |
+                              GRU encoder + Transformer fusion
                                           |              |
                                           v              v
                          15-30 day future queries     East Asia track
@@ -50,6 +54,39 @@ WeatherNext 전 지구 field는 기본적으로 10개 lead time과 `6×12` 공�
 
 분포 branch에는 15일부터 30일까지 하나씩 총 16개의 learnable future query가 있습니다. 이 query들이 masked WeatherNext memory에 cross-attention한 뒤 각 날짜의 Earth-grid logits를 직접 출력합니다. 16개 날짜를 동시에 예측하므로 decoder query 사이에도 causal mask를 적용하지 않습니다.
 
+## GPT state extraction
+
+GPT는 수치 예측값을 대체하지 않고, 다음 10차원 synoptic state를 추가 feature로 제공합니다.
+
+```text
+eastward / northward steering
+recurvature / intensification
+subtropical-high / monsoon influence
+East-Asia approach risk
+track / intensity uncertainty
+state confidence
+```
+
+GPT에는 태풍·주변 고기압 history의 최신값·변화량·유효 비율만 전달합니다. OpenAI Responses API Structured Outputs로 schema를 강제한 뒤 결과를 sample별로 한 번만 cache합니다. 이 state는 FiLM 형태의 scale/shift로 history representation을 동적으로 조절한 다음 GRU에 전달됩니다.
+
+```text
+raw history → masked projection → GPT scale/shift → dynamic history → GRU
+```
+
+API 실패·거절·미생성 state는 `values=0, mask=0`으로 저장됩니다. 이 경우 scale과 shift가 정확히 0이 되어 기존 history가 변경되지 않는 identity 경로로 작동합니다.
+
+```bash
+pip install -e '.[io,small,gpt]'
+
+export OPENAI_API_KEY=...
+
+build-gpt-state-cache \
+  --integrated data/integrated_typhoon_pressure.parquet \
+  --output-dir data/gpt_states \
+  --model gpt-5.6 \
+  --on-error mask
+```
+
 ## 실행
 
 ```bash
@@ -83,6 +120,7 @@ train-weathernext-transformer \
   --integrated data/integrated_typhoon_pressure.parquet \
   --distribution data/distribution/spatial_distribution.csv \
   --weathernext-token-dir data/weathernext_tokens \
+  --gpt-state-dir data/gpt_states \
   --input-mask-probability 0.15 \
   --output checkpoints/weathernext_transformer.pt
 ```

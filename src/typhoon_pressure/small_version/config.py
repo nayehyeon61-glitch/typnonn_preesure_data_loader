@@ -77,6 +77,7 @@ class WeatherNextTokenConfig:
 @dataclass(frozen=True)
 class TransformerConfig:
     forecast_input_dim: int
+    gpt_state_dim: int = 0
     model_dim: int = 128
     num_heads: int = 8
     num_layers: int = 4
@@ -90,3 +91,8 @@ class TransformerConfig:
             raise ValueError("model_dim must be divisible by num_heads")
         if not 0.0 <= self.input_mask_probability < 1.0:
             raise ValueError("input_mask_probability must be in [0, 1)")
+
+
+@dataclass(frozen=True)
+class GPTStateConfig:
+    model: str = "gpt-5.6"

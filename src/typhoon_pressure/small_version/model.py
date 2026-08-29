@@ -81,6 +81,14 @@ class WeatherNextFusionTransformer(nn.Module):
             norm_first=True,
         )
         self.forecast_encoder = nn.TransformerEncoder(layer, transformer_config.num_layers)
+        self.gpt_history_conditioner = None
+        if transformer_config.gpt_state_dim > 0:
+            self.gpt_history_conditioner = nn.Sequential(
+                nn.Linear(transformer_config.gpt_state_dim * 2, hidden * 2),
+                nn.LayerNorm(hidden * 2),
+                nn.GELU(),
+                nn.Linear(hidden * 2, hidden * 2),
+            )
         self.fusion = nn.Sequential(
             nn.Linear(hidden + transformer_config.model_dim, hidden),
             nn.LayerNorm(hidden),
@@ -132,9 +140,27 @@ class WeatherNextFusionTransformer(nn.Module):
         forecast_feature_mask: torch.Tensor,
         forecast_token_mask: torch.Tensor,
         forecast_positions: torch.Tensor,
+        gpt_state_values: torch.Tensor | None = None,
+        gpt_state_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         masked_history = torch.where(history_mask.bool(), history, torch.zeros_like(history))
         history_input = self.history_projection(torch.cat((masked_history, history_mask), dim=-1))
+        gpt_conditioning_fraction = None
+        if self.gpt_history_conditioner is not None:
+            if gpt_state_values is None or gpt_state_mask is None:
+                raise ValueError("GPT state tensors are required when gpt_state_dim > 0")
+            masked_gpt_state = torch.where(
+                gpt_state_mask.bool(), gpt_state_values, torch.zeros_like(gpt_state_values)
+            )
+            gamma, beta = self.gpt_history_conditioner(
+                torch.cat((masked_gpt_state, gpt_state_mask), dim=-1)
+            ).chunk(2, dim=-1)
+            state_available = gpt_state_mask.bool().any(dim=-1, keepdim=True).to(history.dtype)
+            gamma = 0.5 * torch.tanh(gamma) * state_available
+            beta = torch.tanh(beta) * state_available
+            # GPT changes history dynamics before the GRU; a missing state is exact identity.
+            history_input = history_input * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+            gpt_conditioning_fraction = state_available.mean().detach()
         _, history_hidden = self.history_encoder(history_input)
 
         masked_values, effective_feature_mask, effective_token_mask = self._apply_input_mask(
@@ -169,9 +195,12 @@ class WeatherNextFusionTransformer(nn.Module):
         unit_track = torch.sigmoid(raw_track)
         lat = self.bounds.lat_min + (self.bounds.lat_max - self.bounds.lat_min) * unit_track[..., 0]
         lon = self.bounds.lon_min + (self.bounds.lon_max - self.bounds.lon_min) * unit_track[..., 1]
-        return {
+        result = {
             "distribution_logits": distribution_logits,
             "track_latlon": torch.stack((lat, lon), dim=-1),
             "effective_forecast_token_fraction": effective_token_mask.float().mean().detach(),
             "effective_forecast_feature_fraction": effective_feature_mask.mean().detach(),
         }
+        if gpt_conditioning_fraction is not None:
+            result["gpt_history_conditioning_fraction"] = gpt_conditioning_fraction
+        return result

@@ -331,15 +331,19 @@ pytest
 
 ```mermaid
 flowchart TD
-    A["IBTrACS + ERA5 history"] --> C["GRU history encoder"]
+    A["IBTrACS + ERA5 history"]
     W["WeatherNext 0–15 day output"] --> T["Masked Transformer"]
+    A --> S["History summary"]
+    S --> P["GPT structured state cache"]
+    P --> DH["GPT-conditioned dynamic history"]
+    DH --> C["GRU history encoder"]
     T --> X["Fusion encoder"]
     C --> X
-    B["IBTrACS Earth-grid distribution"] --> D["15–30 day soft targets"]
+    B["IBTrACS Earth-grid distribution"] --> DT["15–30 day soft targets"]
     X --> Q["15–30 day future queries"]
     Q --> E["Cross-attention distribution head"]
     X --> F["East Asia track head"]
-    D --> G["Cross entropy"]
+    DT --> G["Cross entropy"]
     E --> G
     F --> H["Masked location MSE"]
     I["IBTrACS local track"] --> H
@@ -388,6 +392,28 @@ train-weathernext-transformer \
 ```
 
 Transformer 입력에는 변수별 결측 mask, token attention mask, history mask와 기본 15% random input mask를 모두 적용합니다. WeatherNext의 0–15일 예측 전체는 사용 가능한 입력이므로 causal mask는 두지 않으며, 15–30일 target은 입력에서 완전히 분리됩니다.
+
+### GPT API state feature
+
+태풍·주변 고기압 history의 제한된 수치 요약을 OpenAI Responses API Structured Outputs에 전달해 10차원 synoptic state를 추출할 수 있습니다. GPT는 학습 중 호출하지 않고 결과를 사전에 cache합니다. Cached state는 history representation을 FiLM 방식으로 조절해 `dynamic history`를 만든 뒤 GRU에 전달됩니다.
+
+```bash
+pip install -e '.[io,small,gpt]'
+export OPENAI_API_KEY=...
+
+build-gpt-state-cache \
+  --integrated data/integrated_typhoon_pressure.parquet \
+  --output-dir data/gpt_states \
+  --on-error mask
+
+train-weathernext-transformer \
+  --integrated data/integrated_typhoon_pressure.parquet \
+  --distribution data/distribution/spatial_distribution.csv \
+  --weathernext-token-dir data/weathernext_tokens \
+  --gpt-state-dir data/gpt_states
+```
+
+API 실패나 state cache 누락은 임의 값으로 대체하지 않습니다. 10차원 값과 mask를 모두 0으로 두어 GPT branch가 fusion에 기여하지 않도록 합니다.
 
 자세한 데이터 계약과 설계 근거는 [`small_version/README.md`](src/typhoon_pressure/small_version/README.md)에 정리했습니다.
 

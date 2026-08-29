@@ -33,6 +33,12 @@ def train_epoch(model, loader, optimizer, criterion, device: torch.device) -> di
         tensors = {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
         optimizer.zero_grad(set_to_none=True)
         if "forecast_values" in tensors:
+            extra_state = {}
+            if "gpt_state_values" in tensors:
+                extra_state = {
+                    "gpt_state_values": tensors["gpt_state_values"],
+                    "gpt_state_mask": tensors["gpt_state_mask"],
+                }
             outputs = model(
                 tensors["history"],
                 tensors["history_mask"],
@@ -40,6 +46,7 @@ def train_epoch(model, loader, optimizer, criterion, device: torch.device) -> di
                 tensors["forecast_feature_mask"],
                 tensors["forecast_token_mask"],
                 tensors["forecast_positions"],
+                **extra_state,
             )
         else:
             outputs = model(tensors["history"], tensors["history_mask"])
@@ -47,6 +54,7 @@ def train_epoch(model, loader, optimizer, criterion, device: torch.device) -> di
         for metric in (
             "effective_forecast_token_fraction",
             "effective_forecast_feature_fraction",
+            "gpt_history_conditioning_fraction",
         ):
             if metric in outputs:
                 losses[metric] = outputs[metric]
