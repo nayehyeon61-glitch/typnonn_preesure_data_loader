@@ -65,6 +65,53 @@ loader = DataLoader(dataset, batch_size=32, shuffle=True)
 - `target`: 미래 태풍 `[lat, lon, pressure_hPa, wind_kt]`
 - `history_mask`, `target_mask`: IBTrACS 결측값과 검출되지 않은 고기압 구분
 
+## 4. WeatherNext 2 초기조건 보정 API
+
+WeatherNext 2의 전체 초기 대기장은 HRES/ERA5에서 가져오고, IBTrACS는 태풍 중심의 tracker seed와 선택적 vortex 보정 자료로 사용합니다.
+
+```python
+from typhoon_pressure import (
+    CorrectionConfig,
+    InitialConditionBuilder,
+    StormObservation,
+    make_weathernext_request,
+)
+
+storm = StormObservation.from_series(tracks.iloc[0])
+
+builder = InitialConditionBuilder(
+    mode="auto",
+    config=CorrectionConfig(
+        position_threshold_km=100,
+        pressure_threshold_hpa=5,
+        search_radius_km=500,
+        correction_radius_km=400,
+    ),
+)
+
+condition = builder.build(
+    atmospheric_state=hres_or_era5_state,
+    storm=storm,
+)
+
+request = make_weathernext_request(
+    condition,
+    horizon_hours=360,
+)
+```
+
+지원 모드:
+
+| mode | 동작 |
+|---|---|
+| `tracker_seed` | 전체 대기장을 수정하지 않고 IBTrACS를 cyclone tracker seed로만 사용 |
+| `vortex_correction` | IBTrACS 위치·기압을 기준으로 MSLP vortex를 이동·보정 |
+| `auto` | 위치 오차 100 km 또는 중심기압 오차 5 hPa 초과 시에만 보정 |
+
+`WeatherNextRequest`는 `initial_state`, `tracker_seed`, `horizon_hours`, 보정 metadata를 분리합니다. 실제 Google WN2 호출은 버전을 고정한 JAX/TPU runner에서 수행하도록 `WeatherNextRunner` 경계로 분리했습니다.
+
+> 현재 vortex correction은 실험적인 MSLP-only 보정입니다. WN2 성능 실험에서는 `tracker_seed`를 baseline으로 두고, MSLP 보정 후 첫 rollout에서 바람·온도·습도장의 동역학적 균형이 유지되는지 반드시 비교해야 합니다.
+
 ## CLI
 
 ```bash
