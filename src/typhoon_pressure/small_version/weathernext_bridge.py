@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -16,14 +17,9 @@ from .config import WeatherNextTokenConfig
 
 
 TOKEN_PROVENANCE_COLUMNS = (
-    "model_id",
-    "model_variant",
-    "release",
-    "weight_origin",
-    "checkpoint_fingerprint",
-    "tokenizer_fingerprint",
-    "feature_schema",
-    "initialization_mode",
+    "model_id", "model_variant", "release", "weight_origin",
+    "checkpoint_fingerprint", "tokenizer_fingerprint",
+    "feature_schema", "initialization_mode",
 )
 
 
@@ -84,8 +80,7 @@ def _resolve_required_variables(dataset: xr.Dataset, requested: tuple[str, ...])
         "10m_v_component_of_wind": ("10m_v_component_of_wind", "v10", "10m_v_wind"),
         "2m_temperature": ("2m_temperature", "t2m", "2m_temp"),
     }
-    resolved: list[str] = []
-    missing: list[str] = []
+    resolved, missing = [], []
     for canonical in requested:
         match = next((candidate for candidate in aliases.get(canonical, (canonical,)) if candidate in dataset), None)
         if match is None:
@@ -94,8 +89,8 @@ def _resolve_required_variables(dataset: xr.Dataset, requested: tuple[str, ...])
             resolved.append(match)
     if missing:
         raise ValueError(
-            "WeatherNext tokenization requires the canonical feature schema; missing="
-            f"{missing}, available={list(dataset.data_vars)}"
+            "WeatherNext tokenization requires the canonical feature schema; "
+            f"missing={missing}, available={list(dataset.data_vars)}"
         )
     return resolved
 
@@ -192,6 +187,18 @@ def _normalise_provenance(provenance: dict | None) -> dict[str, str]:
     return {name: "" if source.get(name) is None else str(source.get(name)) for name in TOKEN_PROVENANCE_COLUMNS}
 
 
+def _validate_manifest_frame(current: pd.DataFrame) -> None:
+    required = {"storm_id", "init_time_ns", "file", *TOKEN_PROVENANCE_COLUMNS}
+    missing_columns = sorted(required.difference(current.columns))
+    if missing_columns:
+        raise ValueError(
+            "Existing WeatherNext token manifest is legacy/incomplete; use a new token directory or rebuild it. "
+            f"Missing columns: {missing_columns}"
+        )
+    if current.duplicated(["storm_id", "init_time_ns"]).any():
+        raise ValueError("WeatherNext token manifest has duplicate sample keys")
+
+
 def save_forecast_tokens(
     tokens: ForecastTokens,
     output_dir: str | Path,
@@ -200,51 +207,59 @@ def save_forecast_tokens(
     init_time,
     provenance: dict | None = None,
 ) -> Path:
-    """Persist one validated token file and provenance-rich manifest entry."""
+    """Atomically persist a token file after manifest/provenance validation."""
     tokens.validate()
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     init_time_ns = int(pd.Timestamp(init_time).value)
     filename = f"{_safe_storm_id(storm_id)}__{init_time_ns}.npz"
     path = output / filename
-    np.savez_compressed(
-        path,
-        values=tokens.values,
-        feature_mask=tokens.feature_mask,
-        token_mask=tokens.token_mask,
-        positions=tokens.positions,
-        feature_names=np.asarray(tokens.feature_names),
-    )
     manifest = output / "manifest.csv"
+
     provenance_row = _normalise_provenance(provenance)
     provenance_row["feature_schema"] = json.dumps(list(tokens.feature_names), separators=(",", ":"))
     new_record = {"storm_id": str(storm_id), "init_time_ns": init_time_ns, "file": filename, **provenance_row}
+
     if manifest.exists():
         current = pd.read_csv(manifest, keep_default_na=False)
-        required = {"storm_id", "init_time_ns", "file", *TOKEN_PROVENANCE_COLUMNS}
-        missing_columns = sorted(required.difference(current.columns))
-        if missing_columns:
-            path.unlink(missing_ok=True)
-            raise ValueError(
-                "Existing WeatherNext token manifest is legacy/incomplete; use a new token directory or rebuild it. "
-                f"Missing columns: {missing_columns}"
-            )
-        duplicate = current.duplicated(["storm_id", "init_time_ns"], keep=False)
-        if duplicate.any():
-            path.unlink(missing_ok=True)
-            raise ValueError("WeatherNext token manifest has duplicate sample keys")
+        _validate_manifest_frame(current)
         same = (current["storm_id"].astype(str) == str(storm_id)) & (current["init_time_ns"].astype("int64") == init_time_ns)
         if same.any():
             old = current.loc[same].iloc[0]
             mismatches = [name for name in TOKEN_PROVENANCE_COLUMNS if str(old[name]) != str(new_record[name])]
             if mismatches:
-                path.unlink(missing_ok=True)
                 raise ValueError(f"WeatherNext token provenance mismatch for {(storm_id, init_time_ns)}: {mismatches}")
             current = current.loc[~same]
-        row = pd.concat((current, pd.DataFrame([new_record])), ignore_index=True)
+        next_manifest = pd.concat((current, pd.DataFrame([new_record])), ignore_index=True)
     else:
-        row = pd.DataFrame([new_record])
-    row.to_csv(manifest, index=False)
+        next_manifest = pd.DataFrame([new_record])
+
+    # Write to temporary files first so a failed serialization never destroys a
+    # previously valid cache entry or manifest.
+    with tempfile.NamedTemporaryFile(dir=output, prefix=filename + ".", suffix=".tmp", delete=False) as handle:
+        temp_npz = Path(handle.name)
+    try:
+        with temp_npz.open("wb") as handle:
+            np.savez_compressed(
+                handle,
+                values=tokens.values,
+                feature_mask=tokens.feature_mask,
+                token_mask=tokens.token_mask,
+                positions=tokens.positions,
+                feature_names=np.asarray(tokens.feature_names),
+            )
+        # Re-open before replacement to verify archive integrity.
+        with np.load(temp_npz, allow_pickle=False) as data:
+            if set(("values", "feature_mask", "token_mask", "positions", "feature_names")).difference(data.files):
+                raise ValueError("Temporary token NPZ failed integrity validation")
+        temp_npz.replace(path)
+    except Exception:
+        temp_npz.unlink(missing_ok=True)
+        raise
+
+    temp_manifest = manifest.with_suffix(".csv.tmp")
+    next_manifest.to_csv(temp_manifest, index=False)
+    temp_manifest.replace(manifest)
     return path
 
 
@@ -264,12 +279,7 @@ class DirectoryForecastTokenStore:
         if not manifest_path.is_file():
             raise FileNotFoundError(f"WeatherNext token manifest does not exist: {manifest_path}")
         manifest = pd.read_csv(manifest_path, keep_default_na=False)
-        required = {"storm_id", "init_time_ns", "file", *TOKEN_PROVENANCE_COLUMNS}
-        missing_columns = sorted(required.difference(manifest.columns))
-        if missing_columns:
-            raise ValueError(f"WeatherNext token manifest is missing columns: {missing_columns}")
-        if manifest.duplicated(["storm_id", "init_time_ns"]).any():
-            raise ValueError("WeatherNext token manifest has duplicate sample keys")
+        _validate_manifest_frame(manifest)
         self.manifest = manifest
         self.files = {
             (str(row.storm_id), int(row.init_time_ns)): self.directory / str(row.file)
@@ -289,7 +299,10 @@ class DirectoryForecastTokenStore:
                 except Exception as exc:
                     raise ValueError(f"Invalid WeatherNext token file for {key}: {path}: {exc}") from exc
                 schemas.add(tokens.feature_names)
-                manifest_schema = tuple(json.loads(self.provenance[key]["feature_schema"]))
+                try:
+                    manifest_schema = tuple(json.loads(self.provenance[key]["feature_schema"]))
+                except Exception as exc:
+                    raise ValueError(f"Invalid manifest feature_schema for {key}") from exc
                 if tokens.feature_names != manifest_schema:
                     raise ValueError(f"Token file/manifest feature schema mismatch for {key}")
             if len(schemas) > 1:
