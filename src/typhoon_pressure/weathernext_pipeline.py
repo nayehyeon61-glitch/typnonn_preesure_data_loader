@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,8 +17,11 @@ from .weathernext_resolver import (
 from .weathernext_input import WeatherNextInputConfig, prepare_weathernext_input
 from .small_version.config import WeatherNextTokenConfig
 from .small_version.weathernext_bridge import (
+    DirectoryForecastTokenStore,
     WeatherNextForecastTokenizer,
+    file_fingerprint,
     save_forecast_tokens,
+    tokenizer_fingerprint,
 )
 
 
@@ -33,6 +37,24 @@ class WeatherNextBatchResult:
     completed: tuple[WeatherNextPreparationResult, ...]
     skipped: tuple[tuple[str, int], ...]
     failed: tuple[tuple[str, int, str], ...]
+
+
+def _token_provenance(
+    resolved: ResolvedWeatherNext,
+    selection: WeatherNextSelectionConfig,
+    token_config: WeatherNextTokenConfig,
+    initialization_mode: str,
+) -> dict[str, str]:
+    return {
+        "model_id": selection.model_id,
+        "model_variant": selection.model_variant,
+        "release": selection.release,
+        "weight_origin": resolved.origin.value,
+        "checkpoint_fingerprint": file_fingerprint(resolved.checkpoint),
+        "tokenizer_fingerprint": tokenizer_fingerprint(token_config),
+        "feature_schema": json.dumps(list(token_config.variables), separators=(",", ":")),
+        "initialization_mode": initialization_mode,
+    }
 
 
 def prepare_weathernext_sample(
@@ -53,13 +75,7 @@ def prepare_weathernext_sample(
     trainable_model=None,
     training_data=None,
 ) -> WeatherNextPreparationResult:
-    """Resolve WeatherNext, run frozen forecast, persist forecast, then tokenize.
-
-    This is the pipeline boundary before Weather-GPT/Fusion training. The
-    resulting token directory can be passed directly to
-    ``train-weathernext-transformer --weathernext-token-dir``.
-    """
-
+    """Resolve WeatherNext, run forecast, persist forecast, then tokenize."""
     if input_config is not None:
         atmospheric_state = prepare_weathernext_input(
             atmospheric_state,
@@ -68,10 +84,7 @@ def prepare_weathernext_sample(
             config=input_config,
         )
 
-    condition = InitialConditionBuilder(
-        mode=initialization_mode,
-        history_steps=2,
-    ).build(atmospheric_state, storm)
+    condition = InitialConditionBuilder(mode=initialization_mode, history_steps=2).build(atmospheric_state, storm)
     request = make_weathernext_request(condition, horizon_hours=horizon_hours)
 
     if resolved is None:
@@ -83,13 +96,11 @@ def prepare_weathernext_sample(
             training_data=training_data,
         )
     forecast = run_weathernext(resolved, request)
-    forecast.attrs.update(
-        {
-            "storm_id": storm.storm_id,
-            "initialization_time": str(storm.time),
-            "initialization_mode": condition.applied_mode,
-        }
-    )
+    forecast.attrs.update({
+        "storm_id": storm.storm_id,
+        "initialization_time": str(storm.time),
+        "initialization_mode": condition.applied_mode,
+    })
 
     forecast_root = Path(forecast_dir)
     forecast_root.mkdir(parents=True, exist_ok=True)
@@ -104,13 +115,10 @@ def prepare_weathernext_sample(
         token_dir,
         storm_id=storm.storm_id,
         init_time=storm.time,
+        provenance=_token_provenance(resolved, selection, token_config, initialization_mode),
     )
 
-    return WeatherNextPreparationResult(
-        resolved=resolved,
-        forecast_path=forecast_path,
-        token_path=token_path,
-    )
+    return WeatherNextPreparationResult(resolved=resolved, forecast_path=forecast_path, token_path=token_path)
 
 
 def prepare_weathernext_batch(
@@ -132,11 +140,7 @@ def prepare_weathernext_batch(
     resume: bool = True,
     on_error: str = "raise",
 ) -> WeatherNextBatchResult:
-    """Generate tokens for every requested ``(storm_id, init_time)`` key.
-
-    The WeatherNext source is resolved (and an opt-in trainable backend fitted)
-    exactly once, then reused across all initialization times.
-    """
+    """Generate provenance-consistent tokens for all requested initializations."""
     if on_error not in {"raise", "continue"}:
         raise ValueError("on_error must be 'raise' or 'continue'")
     resolved = resolve_weathernext(
@@ -146,15 +150,14 @@ def prepare_weathernext_batch(
         trainable_model=trainable_model,
         training_data=training_data,
     )
+    expected_provenance = _token_provenance(resolved, selection, token_config, initialization_mode)
     manifest_path = Path(token_dir) / "manifest.csv"
-    existing: set[tuple[str, int]] = set()
+    existing_store = None
     if resume and manifest_path.exists():
-        import pandas as pd
-
-        manifest = pd.read_csv(manifest_path)
-        existing = set(
-            zip(manifest.storm_id.astype(str), manifest.init_time_ns.astype("int64"))
-        )
+        # Do not pre-validate every file here: a missing/corrupt file should be
+        # regenerated rather than treated as a completed sample. Schema and
+        # duplicate/manifest-column integrity are still checked immediately.
+        existing_store = DirectoryForecastTokenStore(token_dir, validate_files=False)
 
     completed: list[WeatherNextPreparationResult] = []
     skipped: list[tuple[str, int]] = []
@@ -165,9 +168,20 @@ def prepare_weathernext_batch(
         if key in seen:
             raise ValueError(f"Duplicate WeatherNext batch key: {key}")
         seen.add(key)
-        if key in existing:
-            skipped.append(key)
-            continue
+        if existing_store is not None and existing_store.contains(*key):
+            if not existing_store.entry_matches_provenance(*key, expected_provenance):
+                raise ValueError(
+                    f"WeatherNext token provenance mismatch for existing sample {key}. "
+                    "Use a new token directory or rebuild the cache."
+                )
+            try:
+                existing_store.load(*key)
+            except Exception:
+                # Missing/corrupt NPZ: regenerate this sample below.
+                pass
+            else:
+                skipped.append(key)
+                continue
         try:
             completed.append(
                 prepare_weathernext_sample(
