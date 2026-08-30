@@ -9,7 +9,6 @@ from typhoon_pressure.dataset import TyphoonPressureDataset
 from typhoon_pressure.small_version.config import WeatherNextTokenConfig
 from typhoon_pressure.small_version.weathernext_bridge import (
     DirectoryForecastTokenStore,
-    ForecastTokens,
     WeatherNextForecastTokenizer,
     save_forecast_tokens,
     tokenizer_fingerprint,
@@ -124,6 +123,16 @@ def test_provenance_mismatch_does_not_overwrite_existing_npz(tmp_path):
     with pytest.raises(ValueError, match="provenance mismatch"):
         save_forecast_tokens(_tokens(), tmp_path, storm_id="A", init_time=init, provenance=_provenance("second"))
     assert path.read_bytes() == original
+
+
+def test_different_sample_cannot_mix_checkpoint_provenance(tmp_path):
+    save_forecast_tokens(
+        _tokens(), tmp_path, storm_id="A", init_time=pd.Timestamp("2025-01-01"), provenance=_provenance("first")
+    )
+    with pytest.raises(ValueError, match="provenance mismatch"):
+        save_forecast_tokens(
+            _tokens(), tmp_path, storm_id="B", init_time=pd.Timestamp("2025-01-01 06:00"), provenance=_provenance("second")
+        )
 
 
 def test_store_rejects_missing_and_corrupt_token_files(tmp_path):
