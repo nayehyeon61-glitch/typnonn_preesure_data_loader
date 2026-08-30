@@ -197,6 +197,9 @@ def _validate_manifest_frame(current: pd.DataFrame) -> None:
         )
     if current.duplicated(["storm_id", "init_time_ns"]).any():
         raise ValueError("WeatherNext token manifest has duplicate sample keys")
+    mixed = [name for name in TOKEN_PROVENANCE_COLUMNS if current[name].astype(str).nunique(dropna=False) > 1]
+    if mixed:
+        raise ValueError(f"WeatherNext token manifest contains mixed cache provenance: {mixed}")
 
 
 def save_forecast_tokens(
@@ -207,7 +210,7 @@ def save_forecast_tokens(
     init_time,
     provenance: dict | None = None,
 ) -> Path:
-    """Atomically persist a token file after manifest/provenance validation."""
+    """Atomically persist a token file after cache-wide provenance validation."""
     tokens.validate()
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -223,19 +226,20 @@ def save_forecast_tokens(
     if manifest.exists():
         current = pd.read_csv(manifest, keep_default_na=False)
         _validate_manifest_frame(current)
-        same = (current["storm_id"].astype(str) == str(storm_id)) & (current["init_time_ns"].astype("int64") == init_time_ns)
-        if same.any():
-            old = current.loc[same].iloc[0]
-            mismatches = [name for name in TOKEN_PROVENANCE_COLUMNS if str(old[name]) != str(new_record[name])]
+        if not current.empty:
+            reference = current.iloc[0]
+            mismatches = [name for name in TOKEN_PROVENANCE_COLUMNS if str(reference[name]) != str(new_record[name])]
             if mismatches:
-                raise ValueError(f"WeatherNext token provenance mismatch for {(storm_id, init_time_ns)}: {mismatches}")
-            current = current.loc[~same]
+                raise ValueError(
+                    "WeatherNext token directory provenance mismatch; use a new token directory or rebuild the cache. "
+                    f"Mismatched fields: {mismatches}"
+                )
+        same = (current["storm_id"].astype(str) == str(storm_id)) & (current["init_time_ns"].astype("int64") == init_time_ns)
+        current = current.loc[~same]
         next_manifest = pd.concat((current, pd.DataFrame([new_record])), ignore_index=True)
     else:
         next_manifest = pd.DataFrame([new_record])
 
-    # Write to temporary files first so a failed serialization never destroys a
-    # previously valid cache entry or manifest.
     with tempfile.NamedTemporaryFile(dir=output, prefix=filename + ".", suffix=".tmp", delete=False) as handle:
         temp_npz = Path(handle.name)
     try:
@@ -248,7 +252,6 @@ def save_forecast_tokens(
                 positions=tokens.positions,
                 feature_names=np.asarray(tokens.feature_names),
             )
-        # Re-open before replacement to verify archive integrity.
         with np.load(temp_npz, allow_pickle=False) as data:
             if set(("values", "feature_mask", "token_mask", "positions", "feature_names")).difference(data.files):
                 raise ValueError("Temporary token NPZ failed integrity validation")
