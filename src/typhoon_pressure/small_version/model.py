@@ -3,7 +3,13 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from .config import EastAsiaBounds, SmallModelConfig, TransformerConfig
+from .config import (
+    DistributionSamplingConfig,
+    EastAsiaBounds,
+    SmallModelConfig,
+    TransformerConfig,
+)
+from .distribution_sampling import AdaptiveDistributionSampler
 
 
 class SmallDualScaleModel(nn.Module):
@@ -51,7 +57,7 @@ class GPTForecastRouter(nn.Module):
     * channel gate: which latent forecast channels should be emphasized.
 
     Both gates are initialized to the identity (1.0), and a missing GPT state is
-    guaranteed to be an exact identity transformation.  Token representations
+    guaranteed to be an exact identity transformation. Token representations
     already contain forecast values, masks and spatial/lead-time positions, so
     the router can learn rules such as emphasizing northeast/long-lead tokens
     when the GPT semantic state indicates recurvature.
@@ -90,14 +96,11 @@ class GPTForecastRouter(nn.Module):
         available = gpt_state_mask.bool().any(dim=-1, keepdim=True).to(forecast_tokens.dtype)
         context = self.context(torch.cat((masked_gpt_state, gpt_state_mask), dim=-1))
 
-        # Forecast tokens already encode value/mask/lat/lon/lead-time information.
         token_logits = self.token_gate(forecast_tokens + context.unsqueeze(1))
         channel_logits = self.channel_gate(context).unsqueeze(1)
         raw_token_gate = 2.0 * torch.sigmoid(token_logits)
         raw_channel_gate = 2.0 * torch.sigmoid(channel_logits)
 
-        # If GPT is unavailable the router becomes an exact identity, not an
-        # inferred pseudo-state based on zeros.
         available_3d = available.unsqueeze(-1)
         token_gate = 1.0 + available_3d * (raw_token_gate - 1.0)
         channel_gate = 1.0 + available_3d * (raw_channel_gate - 1.0)
@@ -106,17 +109,19 @@ class GPTForecastRouter(nn.Module):
 
 
 class WeatherNextFusionTransformer(nn.Module):
-    """Fuse masked 0–15 day WeatherNext tokens with observed history."""
+    """Fuse WeatherNext/GPT/history and sample adaptive day 15--30 trajectories."""
 
     def __init__(
         self,
         model_config: SmallModelConfig,
         transformer_config: TransformerConfig,
         bounds: EastAsiaBounds = EastAsiaBounds(),
+        sampling_config: DistributionSamplingConfig = DistributionSamplingConfig(),
     ):
         super().__init__()
         self.model_config = model_config
         self.transformer_config = transformer_config
+        self.sampling_config = sampling_config
         self.bounds = bounds
         hidden = model_config.hidden_dim
 
@@ -181,8 +186,18 @@ class WeatherNextFusionTransformer(nn.Module):
         self.future_decoder = nn.TransformerDecoder(
             decoder_layer, transformer_config.decoder_layers
         )
+
+        # Retained for backward-compatible diagnostics. The primary distribution
+        # supervision now uses differentiable probabilities produced by sampled
+        # trajectories rather than these direct categorical logits.
         self.distribution_projection = nn.Linear(
             transformer_config.model_dim, model_config.n_cells
+        )
+        self.distribution_sampler = AdaptiveDistributionSampler(
+            model_config,
+            transformer_config.model_dim,
+            gpt_state_dim=transformer_config.gpt_state_dim,
+            sampling_config=sampling_config,
         )
         self.track_head = nn.Linear(hidden, model_config.local_track_steps * 2)
 
@@ -228,7 +243,6 @@ class WeatherNextFusionTransformer(nn.Module):
             state_available = gpt_state_mask.bool().any(dim=-1, keepdim=True).to(history.dtype)
             gamma = 0.5 * torch.tanh(gamma) * state_available
             beta = torch.tanh(beta) * state_available
-            # GPT changes history dynamics before the GRU; a missing state is exact identity.
             history_input = history_input * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
             gpt_conditioning_fraction = state_available.mean().detach()
         _, history_hidden = self.history_encoder(history_input)
@@ -257,7 +271,6 @@ class WeatherNextFusionTransformer(nn.Module):
 
         cls = self.cls_token.expand(forecast_input.shape[0], -1, -1)
         forecast_input = torch.cat((cls, forecast_input), dim=1)
-        # CLS is always valid, preventing all-masked sequences from producing NaNs.
         padding_mask = torch.cat((
             torch.zeros((effective_token_mask.shape[0], 1), dtype=torch.bool, device=effective_token_mask.device),
             ~effective_token_mask,
@@ -268,7 +281,6 @@ class WeatherNextFusionTransformer(nn.Module):
         forecast_state = forecast_memory[:, 0]
         state = self.fusion(torch.cat((history_hidden[-1], forecast_state), dim=-1))
 
-        # One learned query per future day cross-attends to the routed 0–15 day memory.
         queries = self.future_queries.expand(history.shape[0], -1, -1)
         queries = queries + self.history_to_forecast_dim(state).unsqueeze(1)
         future_states = self.future_decoder(
@@ -277,6 +289,12 @@ class WeatherNextFusionTransformer(nn.Module):
             memory_key_padding_mask=padding_mask,
         )
         distribution_logits = self.distribution_projection(future_states)
+        sampling = self.distribution_sampler(
+            future_states,
+            gpt_state_values=gpt_state_values,
+            gpt_state_mask=gpt_state_mask,
+        )
+
         raw_track = self.track_head(state).view(-1, self.model_config.local_track_steps, 2)
         unit_track = torch.sigmoid(raw_track)
         lat = self.bounds.lat_min + (self.bounds.lat_max - self.bounds.lat_min) * unit_track[..., 0]
@@ -286,6 +304,7 @@ class WeatherNextFusionTransformer(nn.Module):
             "track_latlon": torch.stack((lat, lon), dim=-1),
             "effective_forecast_token_fraction": effective_token_mask.float().mean().detach(),
             "effective_forecast_feature_fraction": effective_feature_mask.mean().detach(),
+            **sampling,
         }
         if gpt_conditioning_fraction is not None:
             result["gpt_history_conditioning_fraction"] = gpt_conditioning_fraction
@@ -303,8 +322,6 @@ class WeatherNextFusionTransformer(nn.Module):
                     "gpt_forecast_router_active_fraction": router_active_fraction,
                     "gpt_forecast_token_gate_mean": token_gate_mean.detach(),
                     "gpt_forecast_channel_gate_mean": router_channel_gate.mean().detach(),
-                    # Detached maps make routing decisions inspectable without
-                    # retaining the training graph.
                     "gpt_forecast_token_gate": token_gate_values.detach(),
                     "gpt_forecast_channel_gate": router_channel_gate.squeeze(1).detach(),
                 }
