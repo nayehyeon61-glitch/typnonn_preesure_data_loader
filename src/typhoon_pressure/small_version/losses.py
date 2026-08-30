@@ -20,22 +20,21 @@ def soft_distribution_cross_entropy(
 
 
 def sampled_distribution_cross_entropy(
-    probabilities: torch.Tensor,
+    log_probabilities: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Soft-label CE on the KDE/rasterized distribution of sampled trajectories.
+    """Soft-label CE on the log KDE mixture of sampled trajectories.
 
-    ``probabilities`` is differentiable with respect to the reparameterized
-    trajectory samples, so this loss trains the mean dynamics and adaptive Q_t
-    rather than merely supervising a separate categorical head.
+    The log probabilities are produced by reparameterized recursive samples and
+    a log-sum-exp mixture, so the loss remains differentiable and numerically
+    stable even for distant global-grid cells.
     """
     target = target / target.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-    probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-    per_lead = -(target * probabilities.clamp_min(1e-12).log()).sum(dim=-1)
+    per_lead = -(target * log_probabilities).sum(dim=-1)
     denominator = mask.sum()
     if denominator.item() == 0:
-        return probabilities.sum() * 0.0
+        return log_probabilities.sum() * 0.0
     return (per_lead * mask).sum() / denominator
 
 
@@ -62,7 +61,7 @@ def east_asia_track_error(
 class DualObjectiveLoss(nn.Module):
     """Track loss + long-range distribution loss.
 
-    WeatherNextFusionTransformer now supplies ``distribution_probabilities``
+    WeatherNextFusionTransformer supplies ``distribution_log_probabilities``
     generated from recursive stochastic trajectories. Older/smaller models can
     still provide direct ``distribution_logits`` and use the legacy CE path.
     """
@@ -72,9 +71,9 @@ class DualObjectiveLoss(nn.Module):
         self.config = config
 
     def forward(self, outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]):
-        if "distribution_probabilities" in outputs:
+        if "distribution_log_probabilities" in outputs:
             distribution_loss = sampled_distribution_cross_entropy(
-                outputs["distribution_probabilities"],
+                outputs["distribution_log_probabilities"],
                 batch["distribution_target"],
                 batch["distribution_mask"],
             )
