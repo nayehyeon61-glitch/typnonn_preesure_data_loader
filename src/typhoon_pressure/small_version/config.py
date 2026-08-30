@@ -54,6 +54,35 @@ class DualLossConfig:
 
 
 @dataclass(frozen=True)
+class DistributionSamplingConfig:
+    """Kalman-inspired adaptive process-noise sampling for day 15-30 states.
+
+    The sampler uses a learned random-walk transition with a positive-definite
+    process covariance Q_t. Samples are propagated recursively in time, so one
+    sample index corresponds to one coherent stochastic trajectory rather than
+    independent per-day draws.
+    """
+
+    num_samples: int = 32
+    min_process_std_deg: float = 0.25
+    max_process_std_deg: float = 12.0
+    max_daily_displacement_deg: float = 15.0
+    grid_kernel_std_deg: float = 5.0
+
+    def __post_init__(self):
+        if self.num_samples < 2:
+            raise ValueError("num_samples must be at least 2")
+        if self.min_process_std_deg <= 0:
+            raise ValueError("min_process_std_deg must be positive")
+        if self.max_process_std_deg <= self.min_process_std_deg:
+            raise ValueError("max_process_std_deg must exceed min_process_std_deg")
+        if self.max_daily_displacement_deg <= 0:
+            raise ValueError("max_daily_displacement_deg must be positive")
+        if self.grid_kernel_std_deg <= 0:
+            raise ValueError("grid_kernel_std_deg must be positive")
+
+
+@dataclass(frozen=True)
 class WeatherNextTokenConfig:
     """Compression settings for a small Transformer over WeatherNext fields."""
 
