@@ -12,7 +12,13 @@ class TyphoonPressureDataset(Dataset):
     State feature: [typhoon lat, lon, pressure, wind,
     high_1 dx, dy, pressure, anomaly, ..., high_K ...].
     Target: future [typhoon lat, lon, pressure, wind].
+
+    Windows are only created when every adjacent timestamp is exactly six
+    hours apart. This prevents a missing synoptic cycle from silently changing
+    the physical duration represented by ``history`` and ``horizon``.
     """
+
+    STEP = pd.Timedelta("6h")
 
     def __init__(self, integrated: pd.DataFrame, history: int, horizon: int, max_highs: int = 3):
         if min(history, horizon, max_highs) < 1:
@@ -20,9 +26,11 @@ class TyphoonPressureDataset(Dataset):
         self.history, self.horizon, self.max_highs = history, horizon, max_highs
         index_cols = ["storm_id", "time"]
         typhoon_cols = ["typhoon_lat", "typhoon_lon", "typhoon_pressure_hpa", "typhoon_wind_kt"]
-        base = integrated[index_cols + typhoon_cols].drop_duplicates(index_cols)
+        frame_input = integrated.copy()
+        frame_input["time"] = pd.to_datetime(frame_input["time"])
+        base = frame_input[index_cols + typhoon_cols].drop_duplicates(index_cols)
         high_values = ["high_dx_km", "high_dy_km", "high_pressure_hpa", "high_anomaly_hpa"]
-        highs = integrated.dropna(subset=["high_rank"])
+        highs = frame_input.dropna(subset=["high_rank"])
         highs = highs[highs.high_rank <= max_highs]
         wide = highs.pivot(index=index_cols, columns="high_rank", values=high_values)
         wide.columns = [f"{name}_{int(rank)}" for name, rank in wide.columns]
@@ -38,11 +46,13 @@ class TyphoonPressureDataset(Dataset):
             for storm_id, group in frame.groupby("storm_id")
         }
         total = history + horizon
-        self.windows = [
-            (storm_id, start)
-            for storm_id, group in self.groups.items()
-            for start in range(len(group) - total + 1)
-        ]
+        self.windows = []
+        for storm_id, group in self.groups.items():
+            times = pd.DatetimeIndex(group["time"])
+            for start in range(len(group) - total + 1):
+                window_times = times[start : start + total]
+                if len(window_times) <= 1 or (window_times[1:] - window_times[:-1] == self.STEP).all():
+                    self.windows.append((storm_id, start))
 
     def __len__(self):
         return len(self.windows)
