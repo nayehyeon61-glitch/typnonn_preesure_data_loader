@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 
@@ -102,9 +104,12 @@ class AdaptiveDistributionSampler(nn.Module):
         lon = torch.remainder(state[..., 1], 360.0)
         return torch.stack((lat, lon), dim=-1)
 
-    def _sample_grid_probabilities(self, samples: torch.Tensor) -> torch.Tensor:
+    def _sample_grid_distribution(
+        self, samples: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # samples: [B, K, T, 2]. Soft rasterization is differentiable, unlike a
-        # hard histogram, and lets distribution loss train the process-noise net.
+        # hard histogram. Work in log space so distant grid cells keep usable
+        # gradients even when their float32 probability would underflow to 0.
         sample_lat = samples[..., 0].unsqueeze(-1)
         sample_lon = samples[..., 1].unsqueeze(-1)
         dlat = sample_lat - self.grid_lat
@@ -112,8 +117,11 @@ class AdaptiveDistributionSampler(nn.Module):
         lon_scale = torch.cos(torch.deg2rad(sample_lat)).abs().clamp_min(0.1)
         distance2 = dlat.square() + (dlon * lon_scale).square()
         sigma2 = self.config.grid_kernel_std_deg ** 2
-        per_sample = torch.softmax(-0.5 * distance2 / sigma2, dim=-1)
-        return per_sample.mean(dim=1)
+        per_sample_log_probability = torch.log_softmax(-0.5 * distance2 / sigma2, dim=-1)
+        log_probability = torch.logsumexp(per_sample_log_probability, dim=1) - math.log(
+            self.config.num_samples
+        )
+        return log_probability.exp(), log_probability
 
     def forward(
         self,
@@ -164,7 +172,7 @@ class AdaptiveDistributionSampler(nn.Module):
             samples.append(current)
             previous = current
         sample_trajectories = torch.stack(samples, dim=2)
-        probabilities = self._sample_grid_probabilities(sample_trajectories)
+        probabilities, log_probabilities = self._sample_grid_distribution(sample_trajectories)
 
         return {
             "distribution_mean_latlon": mean_latlon,
@@ -172,6 +180,7 @@ class AdaptiveDistributionSampler(nn.Module):
             "distribution_process_covariance": covariance,
             "distribution_samples": sample_trajectories,
             "distribution_probabilities": probabilities,
+            "distribution_log_probabilities": log_probabilities,
             "distribution_process_std_mean": torch.sqrt(
                 covariance.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12)
             ).mean().detach(),
