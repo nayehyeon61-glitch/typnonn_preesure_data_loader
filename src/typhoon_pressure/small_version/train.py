@@ -58,6 +58,8 @@ def train_epoch(model, loader, optimizer, criterion, device: torch.device) -> di
             "gpt_forecast_router_active_fraction",
             "gpt_forecast_token_gate_mean",
             "gpt_forecast_channel_gate_mean",
+            "distribution_process_std_mean",
+            "distribution_sample_spread_deg",
         ):
             if metric in outputs:
                 losses[metric] = outputs[metric]
