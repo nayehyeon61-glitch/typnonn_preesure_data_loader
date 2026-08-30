@@ -1,9 +1,11 @@
-"""Convert WeatherNext xarray rollouts into masked Transformer tokens."""
+"""Convert WeatherNext xarray rollouts into validated Transformer token caches."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +13,18 @@ import pandas as pd
 import xarray as xr
 
 from .config import WeatherNextTokenConfig
+
+
+TOKEN_PROVENANCE_COLUMNS = (
+    "model_id",
+    "model_variant",
+    "release",
+    "weight_origin",
+    "checkpoint_fingerprint",
+    "tokenizer_fingerprint",
+    "feature_schema",
+    "initialization_mode",
+)
 
 
 @dataclass(frozen=True)
@@ -30,6 +44,30 @@ class ForecastTokens:
             raise ValueError("token_mask must have shape [tokens]")
         if self.positions.shape != (self.values.shape[0], 6):
             raise ValueError("positions must have shape [tokens, 6]")
+        if len(self.feature_names) != self.values.shape[1]:
+            raise ValueError("feature_names must match token feature dimension")
+        if not np.isfinite(self.values).all():
+            raise ValueError("token values contain non-finite entries")
+        if not np.isfinite(self.positions).all():
+            raise ValueError("token positions contain non-finite entries")
+
+
+def tokenizer_fingerprint(config: WeatherNextTokenConfig) -> str:
+    payload = json.dumps(asdict(config), sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def file_fingerprint(path: str | Path | None) -> str:
+    if not path:
+        return ""
+    candidate = Path(path).expanduser()
+    if not candidate.is_file():
+        return ""
+    digest = hashlib.sha256()
+    with candidate.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _coordinate_name(dataset: xr.Dataset, candidates: tuple[str, ...]) -> str:
@@ -39,25 +77,31 @@ def _coordinate_name(dataset: xr.Dataset, candidates: tuple[str, ...]) -> str:
     raise ValueError(f"None of the coordinates {candidates} exist in WeatherNext output")
 
 
-def _normalise_variable_names(dataset: xr.Dataset, requested: tuple[str, ...]) -> list[str]:
+def _resolve_required_variables(dataset: xr.Dataset, requested: tuple[str, ...]) -> list[str]:
     aliases = {
         "mean_sea_level_pressure": ("mean_sea_level_pressure", "msl", "mslp"),
         "10m_u_component_of_wind": ("10m_u_component_of_wind", "u10", "10m_u_wind"),
         "10m_v_component_of_wind": ("10m_v_component_of_wind", "v10", "10m_v_wind"),
         "2m_temperature": ("2m_temperature", "t2m", "2m_temp"),
     }
-    resolved = []
-    for name in requested:
-        match = next((candidate for candidate in aliases.get(name, (name,)) if candidate in dataset), None)
-        if match is not None:
+    resolved: list[str] = []
+    missing: list[str] = []
+    for canonical in requested:
+        match = next((candidate for candidate in aliases.get(canonical, (canonical,)) if candidate in dataset), None)
+        if match is None:
+            missing.append(canonical)
+        else:
             resolved.append(match)
-    if not resolved:
-        raise ValueError(f"No requested WeatherNext variables are present; available={list(dataset.data_vars)}")
+    if missing:
+        raise ValueError(
+            "WeatherNext tokenization requires the canonical feature schema; missing="
+            f"{missing}, available={list(dataset.data_vars)}"
+        )
     return resolved
 
 
 class WeatherNextForecastTokenizer:
-    """Patch-pool 0–15 day global fields and preserve feature/token validity masks."""
+    """Patch-pool 0–15 day global fields using one canonical feature schema."""
 
     def __init__(self, config: WeatherNextTokenConfig = WeatherNextTokenConfig()):
         self.config = config
@@ -66,7 +110,7 @@ class WeatherNextForecastTokenizer:
         time_name = _coordinate_name(forecast, ("time", "valid_time", "datetime"))
         lat_name = _coordinate_name(forecast, ("latitude", "lat"))
         lon_name = _coordinate_name(forecast, ("longitude", "lon"))
-        variables = _normalise_variable_names(forecast, self.config.variables)
+        variables = _resolve_required_variables(forecast, self.config.variables)
         selected = forecast[variables]
         init = pd.Timestamp(init_time)
         times = pd.to_datetime(selected[time_name].values)
@@ -101,7 +145,6 @@ class WeatherNextForecastTokenizer:
         values = np.stack(values_per_feature, axis=-1).astype(np.float32)
         feature_mask = np.stack(masks_per_feature, axis=-1) & np.isfinite(values)
 
-        # Per-variable robust scaling keeps pressure and wind on comparable ranges.
         for feature in range(values.shape[-1]):
             valid = feature_mask[..., feature]
             if valid.any():
@@ -131,7 +174,7 @@ class WeatherNextForecastTokenizer:
             feature_mask=feature_mask.astype(np.float32),
             token_mask=token_mask.astype(np.float32),
             positions=positions.reshape(-1, 6),
-            feature_names=tuple(variables),
+            feature_names=tuple(self.config.variables),
         )
         result.validate()
         return result
@@ -144,14 +187,20 @@ def _safe_storm_id(storm_id: str) -> str:
     return safe
 
 
+def _normalise_provenance(provenance: dict | None) -> dict[str, str]:
+    source = provenance or {}
+    return {name: "" if source.get(name) is None else str(source.get(name)) for name in TOKEN_PROVENANCE_COLUMNS}
+
+
 def save_forecast_tokens(
     tokens: ForecastTokens,
     output_dir: str | Path,
     *,
     storm_id: str,
     init_time,
+    provenance: dict | None = None,
 ) -> Path:
-    """Persist one tokenized rollout and update the lookup manifest."""
+    """Persist one validated token file and provenance-rich manifest entry."""
     tokens.validate()
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -167,58 +216,108 @@ def save_forecast_tokens(
         feature_names=np.asarray(tokens.feature_names),
     )
     manifest = output / "manifest.csv"
-    row = pd.DataFrame([{"storm_id": str(storm_id), "init_time_ns": init_time_ns, "file": filename}])
+    provenance_row = _normalise_provenance(provenance)
+    provenance_row["feature_schema"] = json.dumps(list(tokens.feature_names), separators=(",", ":"))
+    new_record = {"storm_id": str(storm_id), "init_time_ns": init_time_ns, "file": filename, **provenance_row}
     if manifest.exists():
-        current = pd.read_csv(manifest)
-        keep = ~(
-            (current["storm_id"].astype(str) == str(storm_id))
-            & (current["init_time_ns"].astype("int64") == init_time_ns)
-        )
-        row = pd.concat((current.loc[keep], row), ignore_index=True)
+        current = pd.read_csv(manifest, keep_default_na=False)
+        required = {"storm_id", "init_time_ns", "file", *TOKEN_PROVENANCE_COLUMNS}
+        missing_columns = sorted(required.difference(current.columns))
+        if missing_columns:
+            path.unlink(missing_ok=True)
+            raise ValueError(
+                "Existing WeatherNext token manifest is legacy/incomplete; use a new token directory or rebuild it. "
+                f"Missing columns: {missing_columns}"
+            )
+        duplicate = current.duplicated(["storm_id", "init_time_ns"], keep=False)
+        if duplicate.any():
+            path.unlink(missing_ok=True)
+            raise ValueError("WeatherNext token manifest has duplicate sample keys")
+        same = (current["storm_id"].astype(str) == str(storm_id)) & (current["init_time_ns"].astype("int64") == init_time_ns)
+        if same.any():
+            old = current.loc[same].iloc[0]
+            mismatches = [name for name in TOKEN_PROVENANCE_COLUMNS if str(old[name]) != str(new_record[name])]
+            if mismatches:
+                path.unlink(missing_ok=True)
+                raise ValueError(f"WeatherNext token provenance mismatch for {(storm_id, init_time_ns)}: {mismatches}")
+            current = current.loc[~same]
+        row = pd.concat((current, pd.DataFrame([new_record])), ignore_index=True)
+    else:
+        row = pd.DataFrame([new_record])
     row.to_csv(manifest, index=False)
     return path
 
 
-def run_and_save_weathernext_tokens(
-    runner,
-    request,
-    tokenizer: WeatherNextForecastTokenizer,
-    output_dir: str | Path,
-) -> Path:
-    """Execute the configured WeatherNext runner and persist Transformer inputs."""
+def run_and_save_weathernext_tokens(runner, request, tokenizer: WeatherNextForecastTokenizer, output_dir: str | Path) -> Path:
     from typhoon_pressure.weathernext_adapter import run_weathernext
-
     forecast = run_weathernext(runner, request)
     tokens = tokenizer(forecast, request.tracker_seed["time"])
-    return save_forecast_tokens(
-        tokens,
-        output_dir,
-        storm_id=request.tracker_seed["storm_id"],
-        init_time=request.tracker_seed["time"],
-    )
+    return save_forecast_tokens(tokens, output_dir, storm_id=request.tracker_seed["storm_id"], init_time=request.tracker_seed["time"])
 
 
 class DirectoryForecastTokenStore:
-    """Load pre-tokenized WeatherNext rollouts by (storm_id, initialization time)."""
+    """Load and validate pre-tokenized WeatherNext rollouts by sample key."""
 
-    def __init__(self, directory: str | Path):
+    def __init__(self, directory: str | Path, *, validate_files: bool = True):
         self.directory = Path(directory)
-        manifest = pd.read_csv(self.directory / "manifest.csv")
+        manifest_path = self.directory / "manifest.csv"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"WeatherNext token manifest does not exist: {manifest_path}")
+        manifest = pd.read_csv(manifest_path, keep_default_na=False)
+        required = {"storm_id", "init_time_ns", "file", *TOKEN_PROVENANCE_COLUMNS}
+        missing_columns = sorted(required.difference(manifest.columns))
+        if missing_columns:
+            raise ValueError(f"WeatherNext token manifest is missing columns: {missing_columns}")
         if manifest.duplicated(["storm_id", "init_time_ns"]).any():
             raise ValueError("WeatherNext token manifest has duplicate sample keys")
+        self.manifest = manifest
         self.files = {
             (str(row.storm_id), int(row.init_time_ns)): self.directory / str(row.file)
             for row in manifest.itertuples(index=False)
         }
+        self.provenance = {
+            (str(row.storm_id), int(row.init_time_ns)): {name: str(getattr(row, name)) for name in TOKEN_PROVENANCE_COLUMNS}
+            for row in manifest.itertuples(index=False)
+        }
+        if validate_files:
+            schemas: set[tuple[str, ...]] = set()
+            for key, path in self.files.items():
+                if not path.is_file():
+                    raise FileNotFoundError(f"WeatherNext token file is missing for {key}: {path}")
+                try:
+                    tokens = self.load(*key)
+                except Exception as exc:
+                    raise ValueError(f"Invalid WeatherNext token file for {key}: {path}: {exc}") from exc
+                schemas.add(tokens.feature_names)
+                manifest_schema = tuple(json.loads(self.provenance[key]["feature_schema"]))
+                if tokens.feature_names != manifest_schema:
+                    raise ValueError(f"Token file/manifest feature schema mismatch for {key}")
+            if len(schemas) > 1:
+                raise ValueError(f"WeatherNext token directory contains mixed feature schemas: {sorted(schemas)}")
 
     def contains(self, storm_id: str, init_time_ns: int) -> bool:
         return (str(storm_id), int(init_time_ns)) in self.files
+
+    def entry_matches_provenance(self, storm_id: str, init_time_ns: int, expected: dict) -> bool:
+        key = (str(storm_id), int(init_time_ns))
+        if key not in self.files or not self.files[key].is_file():
+            return False
+        actual = self.provenance[key]
+        normalized = _normalise_provenance(expected)
+        return all(str(actual[name]) == str(normalized[name]) for name in TOKEN_PROVENANCE_COLUMNS)
 
     def load(self, storm_id: str, init_time_ns: int) -> ForecastTokens:
         key = (str(storm_id), int(init_time_ns))
         if key not in self.files:
             raise KeyError(f"No WeatherNext tokens for {key}")
-        with np.load(self.files[key], allow_pickle=False) as data:
+        path = self.files[key]
+        if not path.is_file():
+            raise FileNotFoundError(f"WeatherNext token file is missing for {key}: {path}")
+        with np.load(path, allow_pickle=False) as data:
+            required = {"values", "feature_mask", "token_mask", "positions", "feature_names"}
+            missing = sorted(required.difference(data.files))
+            if missing:
+                raise ValueError(f"Token NPZ is missing arrays: {missing}")
             result = ForecastTokens(
                 values=data["values"].astype(np.float32),
                 feature_mask=data["feature_mask"].astype(np.float32),
