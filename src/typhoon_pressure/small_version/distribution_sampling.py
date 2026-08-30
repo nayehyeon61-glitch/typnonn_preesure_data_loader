@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 from torch import nn
 
@@ -13,13 +11,13 @@ from .config import DistributionSamplingConfig, SmallModelConfig
 class AdaptiveDistributionSampler(nn.Module):
     """Kalman-inspired adaptive process-noise sampler for day 15--30.
 
-    This is a process model rather than a full Kalman measurement update.  The
+    This is a process model rather than a full Kalman measurement update. The
     routed WeatherNext/fusion representation acts as the dynamical prior and a
-    learned positive-definite Q_t controls uncertainty growth.  When GPT state
+    learned positive-definite Q_t controls uncertainty growth. When GPT state
     is present it explicitly conditions Q_t, so semantic confidence and track
     uncertainty can change the sampled spread.
 
-    One sample index is propagated recursively through every lead day.  The
+    One sample index is propagated recursively through every lead day. The
     output therefore represents K coherent stochastic trajectories instead of
     independent per-day draws.
     """
@@ -50,10 +48,11 @@ class AdaptiveDistributionSampler(nn.Module):
                 nn.Linear(model_dim, model_dim),
             )
 
-        # Start with small, nearly isotropic process noise. The network can then
-        # increase/decrease and correlate noise as evidence accumulates.
+        # Start with modest uncorrelated Q_t. The diagonal raw parameters are
+        # negative (small std), while rho starts exactly at zero.
         nn.init.zeros_(self.process_noise_head.weight)
-        nn.init.constant_(self.process_noise_head.bias, -2.0)
+        with torch.no_grad():
+            self.process_noise_head.bias.copy_(torch.tensor([-2.0, 0.0, -2.0]))
 
         lat_centres = -90.0 + (
             torch.arange(model_config.n_lat, dtype=torch.float32) + 0.5
@@ -156,11 +155,7 @@ class AdaptiveDistributionSampler(nn.Module):
                 dtype=future_states.dtype,
                 device=future_states.device,
             )
-            noise = torch.einsum("btij,bkj->bki", chol[:, lead : lead + 1], epsilon)
-            # einsum above retains a singleton lead dimension in some torch
-            # versions; normalize to [B,K,2].
-            if noise.ndim == 4:
-                noise = noise[:, 0]
+            noise = torch.einsum("bij,bkj->bki", chol[:, lead], epsilon)
             if lead == 0:
                 current = mean_latlon[:, 0].unsqueeze(1) + noise
             else:
