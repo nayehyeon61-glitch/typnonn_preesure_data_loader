@@ -19,6 +19,26 @@ def soft_distribution_cross_entropy(
     return (per_lead * mask).sum() / denominator
 
 
+def sampled_distribution_cross_entropy(
+    probabilities: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Soft-label CE on the KDE/rasterized distribution of sampled trajectories.
+
+    ``probabilities`` is differentiable with respect to the reparameterized
+    trajectory samples, so this loss trains the mean dynamics and adaptive Q_t
+    rather than merely supervising a separate categorical head.
+    """
+    target = target / target.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    per_lead = -(target * probabilities.clamp_min(1e-12).log()).sum(dim=-1)
+    denominator = mask.sum()
+    if denominator.item() == 0:
+        return probabilities.sum() * 0.0
+    return (per_lead * mask).sum() / denominator
+
+
 def east_asia_track_error(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -40,16 +60,30 @@ def east_asia_track_error(
 
 
 class DualObjectiveLoss(nn.Module):
-    """L = lambda_dist * CE + lambda_track * normalized local MSE."""
+    """Track loss + long-range distribution loss.
+
+    WeatherNextFusionTransformer now supplies ``distribution_probabilities``
+    generated from recursive stochastic trajectories. Older/smaller models can
+    still provide direct ``distribution_logits`` and use the legacy CE path.
+    """
 
     def __init__(self, config: DualLossConfig = DualLossConfig()):
         super().__init__()
         self.config = config
 
     def forward(self, outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]):
-        distribution_loss = soft_distribution_cross_entropy(
-            outputs["distribution_logits"], batch["distribution_target"], batch["distribution_mask"]
-        )
+        if "distribution_probabilities" in outputs:
+            distribution_loss = sampled_distribution_cross_entropy(
+                outputs["distribution_probabilities"],
+                batch["distribution_target"],
+                batch["distribution_mask"],
+            )
+        else:
+            distribution_loss = soft_distribution_cross_entropy(
+                outputs["distribution_logits"],
+                batch["distribution_target"],
+                batch["distribution_mask"],
+            )
         track_loss, track_rmse_km = east_asia_track_error(
             outputs["track_latlon"], batch["track_target"], batch["track_mask"], self.config.track_scale_km
         )
@@ -63,4 +97,3 @@ class DualObjectiveLoss(nn.Module):
             "local_track_mse_normalized": track_loss,
             "local_track_rmse_km": track_rmse_km,
         }
-
