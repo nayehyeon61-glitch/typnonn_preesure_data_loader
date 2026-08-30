@@ -9,7 +9,12 @@ from torch.utils.data import DataLoader
 
 from typhoon_pressure.dataset import TyphoonPressureDataset
 
-from .config import DualLossConfig, SmallModelConfig, TransformerConfig
+from .config import (
+    DistributionSamplingConfig,
+    DualLossConfig,
+    SmallModelConfig,
+    TransformerConfig,
+)
 from .dataset import SpatialDistributionLookup, WeatherNextDualTargetDataset
 from .losses import DualObjectiveLoss
 from .model import WeatherNextFusionTransformer
@@ -19,14 +24,14 @@ from .weathernext_bridge import DirectoryForecastTokenStore
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Train 15–30 day predictions from masked WeatherNext Transformer inputs"
+        description="Train WeatherNext/GPT fusion with adaptive day 15-30 trajectory sampling"
     )
     parser.add_argument("--integrated", required=True)
     parser.add_argument("--distribution", required=True)
     parser.add_argument("--weathernext-token-dir", required=True)
     parser.add_argument(
         "--gpt-state-dir",
-        help="Enable GPT Router with cache produced by build-gpt-state-cache",
+        help="Enable GPT Router/noise conditioning with cache produced by build-gpt-state-cache",
     )
     parser.add_argument(
         "--require-valid-gpt-states",
@@ -46,6 +51,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--input-mask-probability", type=float, default=0.15)
     parser.add_argument("--distribution-weight", type=float, default=1.0)
     parser.add_argument("--track-weight", type=float, default=1.0)
+    parser.add_argument("--distribution-samples", type=int, default=32)
+    parser.add_argument("--process-noise-min-std-deg", type=float, default=0.25)
+    parser.add_argument("--process-noise-max-std-deg", type=float, default=12.0)
+    parser.add_argument("--max-daily-displacement-deg", type=float, default=15.0)
+    parser.add_argument("--distribution-kernel-std-deg", type=float, default=5.0)
     parser.add_argument("--output", default="checkpoints/weathernext_transformer.pt")
     args = parser.parse_args(argv)
 
@@ -90,6 +100,13 @@ def main(argv: list[str] | None = None) -> int:
         decoder_layers=args.decoder_layers,
         input_mask_probability=args.input_mask_probability,
     )
+    sampling_config = DistributionSamplingConfig(
+        num_samples=args.distribution_samples,
+        min_process_std_deg=args.process_noise_min_std_deg,
+        max_process_std_deg=args.process_noise_max_std_deg,
+        max_daily_displacement_deg=args.max_daily_displacement_deg,
+        grid_kernel_std_deg=args.distribution_kernel_std_deg,
+    )
     dataset_kwargs = dict(
         base_dataset=base,
         distribution=lookup,
@@ -110,7 +127,9 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("No base samples match the WeatherNext token manifest")
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = WeatherNextFusionTransformer(model_config, transformer_config).to(device)
+    model = WeatherNextFusionTransformer(
+        model_config, transformer_config, sampling_config=sampling_config
+    ).to(device)
     criterion = DualObjectiveLoss(DualLossConfig(
         distribution_weight=args.distribution_weight,
         local_track_weight=args.track_weight,
@@ -125,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
         "model": model.state_dict(),
         "model_config": model_config.__dict__,
         "transformer_config": transformer_config.__dict__,
+        "sampling_config": sampling_config.__dict__,
     }, output)
     return 0
 
