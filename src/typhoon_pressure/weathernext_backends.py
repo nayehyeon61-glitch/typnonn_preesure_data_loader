@@ -10,6 +10,7 @@ import xarray as xr
 class WeatherNextBackend(str, Enum):
     TRAINABLE = "trainable"
     PRETRAINED = "pretrained"
+    FLOW_MATCHING = "flow_matching"
     API = "api"
 
 
@@ -54,8 +55,13 @@ class WeatherNextBackendConfig:
             raise ValueError("WeatherNext model_id cannot be empty")
         if not self.release.strip():
             raise ValueError("Pin a WeatherNext release for reproducibility")
-        if self.backend_type is WeatherNextBackend.PRETRAINED and not self.checkpoint:
-            raise ValueError("pretrained backend requires a checkpoint identifier or path")
+        if self.backend_type in {
+            WeatherNextBackend.PRETRAINED,
+            WeatherNextBackend.FLOW_MATCHING,
+        } and not self.checkpoint:
+            raise ValueError(
+                f"{self.backend_type.value} backend requires a checkpoint identifier or path"
+            )
         if self.backend_type is WeatherNextBackend.API and not self.api_provider:
             raise ValueError("api backend requires api_provider provenance")
 
@@ -102,6 +108,32 @@ class PretrainedWeatherNextRunner(_RunnerMetadata):
 
 
 @dataclass
+class FrozenFlowMatchingRunner:
+    """Inference-only bridge to a monthly climate_diffusion checkpoint."""
+
+    config: WeatherNextBackendConfig
+    model: RolloutModel
+    inference_only: bool = field(default=True, init=False)
+
+    def provenance(self) -> dict[str, str | int | bool | None]:
+        model_provenance = getattr(self.model, "provenance", None)
+        values = dict(model_provenance()) if callable(model_provenance) else {}
+        values.update(
+            {
+                "forecast_backend": "flow_matching",
+                "forecast_checkpoint": self.config.checkpoint,
+                "forecast_checkpoint_kind": "flow_matching",
+                "forecast_release": self.config.release,
+                "inference_only": True,
+            }
+        )
+        return values
+
+    def rollout(self, initial_state: xr.Dataset, horizon_hours: int) -> xr.Dataset:
+        return self.model.rollout(initial_state, horizon_hours)
+
+
+@dataclass
 class APIWeatherNextRunner(_RunnerMetadata):
     config: WeatherNextBackendConfig
     client: WeatherNextAPIClient
@@ -137,6 +169,16 @@ def build_weathernext_runner(
                 release=config.release,
             )
         return PretrainedWeatherNextRunner(config, pretrained_model)
+    if backend is WeatherNextBackend.FLOW_MATCHING:
+        if pretrained_model is None:
+            try:
+                from climate_diffusion import FlowMatchingWeatherRunner
+            except ImportError as exc:
+                raise ImportError(
+                    "flow_matching backend requires the climate-diffusion package"
+                ) from exc
+            pretrained_model = FlowMatchingWeatherRunner(config.checkpoint)
+        return FrozenFlowMatchingRunner(config, pretrained_model)
     if api_client is None:
         raise ValueError("api backend requires api_client")
     return APIWeatherNextRunner(config, api_client)

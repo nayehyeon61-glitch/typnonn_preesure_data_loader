@@ -13,7 +13,7 @@ from .small_version.weathernext_bridge import (
     WeatherNextForecastTokenizer,
     run_and_save_weathernext_tokens,
 )
-from .weathernext_adapter import make_weathernext_request
+from .weathernext_adapter import WeatherNextRequest, make_weathernext_request
 from .weathernext_backends import WeatherNextBackendConfig, build_weathernext_runner
 
 
@@ -28,10 +28,14 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     parser.add_argument("--initial-state", required=True, help="Global HRES/ERA5 NetCDF or Zarr")
+    parser.add_argument(
+        "--backend",
+        choices=["pretrained", "flow_matching"],
+        default="pretrained",
+    )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument(
         "--model-variant",
-        required=True,
         choices=["WeatherNext2", "WeatherNextCyclones", "WeatherNextCyclones_Mini"],
     )
     parser.add_argument("--model-id")
@@ -47,13 +51,20 @@ def main(argv: list[str] | None = None) -> int:
         choices=["tracker_seed", "vortex_correction", "auto"],
         default="auto",
     )
-    parser.add_argument("--horizon-hours", type=int, default=360)
+    parser.add_argument("--horizon-hours", type=int)
+    parser.add_argument("--max-lead-hours", type=int)
     parser.add_argument("--output-dir", default="data/weathernext_tokens")
     parser.add_argument("--variables", nargs="*")
     parser.add_argument("--max-time-steps", type=int, default=10)
     parser.add_argument("--lat-tokens", type=int, default=6)
     parser.add_argument("--lon-tokens", type=int, default=12)
     args = parser.parse_args(argv)
+
+    if args.backend == "pretrained" and not args.model_variant:
+        parser.error("--model-variant is required for the pretrained backend")
+    horizon_hours = args.horizon_hours or (
+        720 if args.backend == "flow_matching" else 360
+    )
 
     storm = StormObservation(
         storm_id=args.storm_id,
@@ -64,23 +75,57 @@ def main(argv: list[str] | None = None) -> int:
         wind_kt=args.storm_wind_kt,
     )
     with _open_dataset(args.initial_state) as atmospheric_state:
-        condition = InitialConditionBuilder(
-            mode=args.initialization_mode,
-            history_steps=2,
-        ).build(atmospheric_state, storm)
-        request = make_weathernext_request(condition, args.horizon_hours)
         config = WeatherNextBackendConfig(
-            backend="pretrained",
-            model_id=args.model_id or args.model_variant,
+            backend=args.backend,
+            model_id=args.model_id or args.model_variant or "monthly-flow-matching",
             model_variant=args.model_variant,
-            release=args.release,
+            release=args.release if args.backend == "pretrained" else "monthly-v1",
             checkpoint=args.checkpoint,
         )
         runner = build_weathernext_runner(config)
+        if args.backend == "flow_matching":
+            if horizon_hours <= 0 or horizon_hours % 720:
+                parser.error("flow_matching horizon must be a positive 720-hour multiple")
+            time_name = next(
+                (
+                    name
+                    for name in ("time", "valid_time", "datetime")
+                    if name in atmospheric_state.coords
+                ),
+                None,
+            )
+            if time_name is None:
+                raise ValueError("Flow initial state requires a time coordinate")
+            causal_state = atmospheric_state.sel(
+                {time_name: slice(None, storm.time.to_datetime64())}
+            ).load()
+            request = WeatherNextRequest(
+                initial_state=causal_state,
+                tracker_seed={
+                    "storm_id": storm.storm_id,
+                    "time": storm.time,
+                    "lat": storm.lat,
+                    "lon": storm.lon,
+                    "pressure_hpa": storm.pressure_hpa,
+                    "wind_kt": storm.wind_kt,
+                },
+                horizon_hours=horizon_hours,
+                initialization_metadata={
+                    "requested_mode": "flow_monthly_history",
+                    "correction_applied": False,
+                },
+            )
+        else:
+            condition = InitialConditionBuilder(
+                mode=args.initialization_mode,
+                history_steps=2,
+            ).build(atmospheric_state, storm)
+            request = make_weathernext_request(condition, horizon_hours)
         defaults = WeatherNextTokenConfig()
         tokenizer = WeatherNextForecastTokenizer(
             WeatherNextTokenConfig(
                 variables=tuple(args.variables) if args.variables else defaults.variables,
+                max_lead_hours=args.max_lead_hours or horizon_hours,
                 max_time_steps=args.max_time_steps,
                 target_lat_tokens=args.lat_tokens,
                 target_lon_tokens=args.lon_tokens,

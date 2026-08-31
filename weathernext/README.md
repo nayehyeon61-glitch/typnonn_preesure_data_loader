@@ -154,7 +154,24 @@ train-weathernext-transformer ... \
 pretrained 출력과 fine-tuned 출력 중 어느 쪽을 사용했는지 사후 확인할 수 있습니다.
 자세한 실행 순서는 [`../download/README.md`](../download/README.md)를 참고하십시오.
 
-### 3. API 또는 managed forecast feed
+### 3. Frozen monthly Flow Matching
+
+```python
+config = WeatherNextBackendConfig(
+    backend="flow_matching",
+    model_id="monthly-flow-matching",
+    release="monthly-v1",
+    checkpoint="/weights/climate-flow-monthly-v1.pt",
+)
+runner = build_weathernext_runner(config)
+forecast = runner.rollout(monthly_history, horizon_hours=720)
+```
+
+`pip install -e '.[flow]'`로 `climate-diffusion` package를 설치해야 합니다. runner는 checkpoint hash를
+검증하고 모든 parameter를 frozen한 추론 경로만 제공합니다. 720시간 출력을 후단
+token으로 만들 때는 `max_lead_hours=720`을 사용합니다.
+
+### 4. API 또는 managed forecast feed
 
 ```python
 config = WeatherNextBackendConfig(
@@ -179,6 +196,11 @@ weathernext_model_id
 weathernext_release
 weathernext_checkpoint
 weathernext_api_provider
+forecast_backend
+forecast_checkpoint
+forecast_checkpoint_kind
+forecast_checkpoint_sha256
+forecast_checkpoint_format
 ```
 
 예측 CSV에 `weathernext_backend`를 유지하면 IBTrACS evaluation이 `metrics_by_backend.csv`를 생성합니다.

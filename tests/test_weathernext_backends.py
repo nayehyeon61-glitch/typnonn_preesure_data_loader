@@ -111,3 +111,21 @@ def test_api_backend_calls_injected_client_and_records_provider():
     assert client.model_id == "WeatherNext2_<2025"
     assert forecast.attrs["weathernext_backend"] == "api"
     assert forecast.attrs["weathernext_api_provider"] == "vertex-ai"
+
+
+def test_flow_matching_backend_is_frozen_and_records_generic_provenance():
+    model = FakeModel()
+    runner = build_weathernext_runner(
+        WeatherNextBackendConfig(
+            "flow_matching",
+            checkpoint="/weights/climate-flow-monthly-v1.pt",
+            release="monthly-v1",
+        ),
+        pretrained_model=model,
+    )
+    forecast = run_weathernext(runner, _request())
+    assert runner.inference_only is True
+    assert model.fit_called is False
+    assert forecast.attrs["forecast_backend"] == "flow_matching"
+    assert forecast.attrs["forecast_checkpoint_kind"] == "flow_matching"
+    assert forecast.attrs["forecast_release"] == "monthly-v1"

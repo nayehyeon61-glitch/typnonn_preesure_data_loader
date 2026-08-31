@@ -13,6 +13,13 @@ import xarray as xr
 from .config import WeatherNextTokenConfig
 
 PROVENANCE_FIELDS = (
+    "forecast_backend",
+    "forecast_checkpoint",
+    "forecast_checkpoint_kind",
+    "forecast_checkpoint_sha256",
+    "forecast_checkpoint_format",
+    "forecast_release",
+    "forecast_step_hours",
     "weathernext_backend",
     "weathernext_model_id",
     "weathernext_model_variant",
@@ -66,7 +73,7 @@ def _normalise_variable_names(dataset: xr.Dataset, requested: tuple[str, ...]) -
 
 
 class WeatherNextForecastTokenizer:
-    """Patch-pool 0–15 day global fields and preserve feature/token validity masks."""
+    """Patch-pool a configured forecast horizon and preserve validity masks."""
 
     def __init__(self, config: WeatherNextTokenConfig | None = None):
         self.config = config or WeatherNextTokenConfig()
@@ -82,7 +89,9 @@ class WeatherNextForecastTokenizer:
         lead_hours = np.asarray([(pd.Timestamp(value) - init).total_seconds() / 3600.0 for value in times])
         valid_times = np.flatnonzero((lead_hours >= 0) & (lead_hours <= self.config.max_lead_hours))
         if valid_times.size == 0:
-            raise ValueError("WeatherNext output contains no 0–15 day forecast times")
+            raise ValueError(
+                f"Forecast output contains no 0–{self.config.max_lead_hours} hour times"
+            )
         if valid_times.size > self.config.max_time_steps:
             chosen = np.linspace(0, valid_times.size - 1, self.config.max_time_steps).round().astype(int)
             valid_times = valid_times[chosen]
@@ -257,15 +266,18 @@ class DirectoryForecastTokenStore:
         return result
 
     def require_checkpoint_kind(self, expected: str) -> None:
-        actual = self.provenance().get("weathernext_checkpoint_kind")
+        provenance = self.provenance()
+        actual = provenance.get("forecast_checkpoint_kind")
+        if actual is None:
+            actual = provenance.get("weathernext_checkpoint_kind")
         if actual is None:
             raise ValueError(
-                "WeatherNext token manifest has no checkpoint provenance; regenerate "
+                "Forecast token manifest has no checkpoint provenance; regenerate "
                 "tokens with prepare-weathernext-tokens"
             )
         if actual != expected:
             raise ValueError(
-                f"Expected {expected} WeatherNext tokens, but manifest records {actual}"
+                f"Expected {expected} forecast tokens, but manifest records {actual}"
             )
 
     def contains(self, storm_id: str, init_time_ns: int) -> bool:

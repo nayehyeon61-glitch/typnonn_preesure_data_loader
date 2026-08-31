@@ -284,6 +284,41 @@ fine-tuned weight를 사용할 때는 checkpoint만
 checkpoint provenance가 보존되므로 실제 적용 여부를 확인할 수 있습니다. 전체
 명령과 파일 구조는 [`download/README.md`](download/README.md)를 참고하십시오.
 
+### Frozen 월별 Flow Matching 통합
+
+`climate_diffusion`에서 사전학습한 한 달 예측 checkpoint도 forecast backend로
+사용할 수 있습니다. Flow 모델은 `eval() + requires_grad_(False) + inference_mode()`로
+고정되며 후단 optimizer에는 포함되지 않습니다.
+
+```bash
+pip install -e '.[flow]'
+
+prepare-weathernext-tokens \
+  --backend flow_matching \
+  --initial-state data/era5_hres_history.zarr \
+  --checkpoint ../climate_diffusion/download/flow-matching/monthly-v1/climate-flow-monthly-v1.pt \
+  --storm-id WP012026 --init-time 2026-08-01T00:00:00 \
+  --storm-lat 22.5 --storm-lon 132.0 \
+  --horizon-hours 720 --max-lead-hours 720 \
+  --output-dir data/flow_matching_tokens
+
+train-weathernext-transformer \
+  --integrated data/integrated.parquet \
+  --distribution data/spatial_distribution.csv \
+  --weathernext-token-dir data/flow_matching_tokens \
+  --gpt-state-dir data/gpt_states \
+  --require-checkpoint-kind flow_matching \
+  --output checkpoints/flow_matching_fusion.pt
+```
+
+이 경우에도 GPT conditioning과 GRU/Transformer, distribution cross-entropy +
+track MSE double loss는 동일하게 학습됩니다. token manifest와 최종 checkpoint에는
+Flow checkpoint 경로·SHA-256·format이 `forecast_provenance`로 보존됩니다.
+
+월별 Flow는 720시간 state를 생성하므로 WeatherNext2의 0–360시간 성능을 직접
+공정 비교하는 모델은 아닙니다. 15일 대체 실험에는 별도의 6시간 간격 trajectory
+Flow checkpoint와 동일 360시간 tokenizer 계약이 필요합니다.
+
 ### 보정 전후 평가
 
 동일한 초기 시각과 태풍에 대해 다음 세 실험을 분리하십시오.

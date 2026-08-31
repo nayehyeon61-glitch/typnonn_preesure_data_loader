@@ -8,6 +8,7 @@ from typhoon_pressure.dataset import TyphoonPressureDataset
 from typhoon_pressure.small_version import (
     DirectoryForecastTokenStore,
     DualObjectiveLoss,
+    ForecastTokens,
     SmallModelConfig,
     SpatialDistributionLookup,
     TransformerConfig,
@@ -119,3 +120,27 @@ def test_weathernext_output_reaches_masked_transformer(tmp_path):
     assert not torch.allclose(
         conditioned_outputs["distribution_logits"], unconditioned_outputs["distribution_logits"]
     )
+
+
+def test_flow_matching_token_manifest_uses_generic_checkpoint_identity(tmp_path):
+    tokens = ForecastTokens(
+        values=np.ones((1, 1), dtype=np.float32),
+        feature_mask=np.ones((1, 1), dtype=np.float32),
+        token_mask=np.ones(1, dtype=np.float32),
+        positions=np.zeros((1, 6), dtype=np.float32),
+        feature_names=("msl",),
+    )
+    save_forecast_tokens(
+        tokens,
+        tmp_path,
+        storm_id="FLOW",
+        init_time=pd.Timestamp("2025-01-01"),
+        provenance={
+            "forecast_backend": "flow_matching",
+            "forecast_checkpoint_kind": "flow_matching",
+            "forecast_checkpoint_sha256": "abc123",
+        },
+    )
+    store = DirectoryForecastTokenStore(tmp_path)
+    store.require_checkpoint_kind("flow_matching")
+    assert store.provenance()["forecast_checkpoint_sha256"] == "abc123"
