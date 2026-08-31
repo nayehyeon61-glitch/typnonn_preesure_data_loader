@@ -373,6 +373,10 @@ train-small-typhoon-model \
 WeatherNext 연결 버전:
 
 ```bash
+build-storm-split \
+  --integrated data/integrated_typhoon_pressure.parquet \
+  --output data/storm_split.csv
+
 tokenize-weathernext-output \
   --forecast data/weathernext/forecast.nc \
   --storm-id 2025001N12000 \
@@ -382,6 +386,7 @@ tokenize-weathernext-output \
 train-weathernext-transformer \
   --integrated data/integrated_typhoon_pressure.parquet \
   --distribution data/distribution/spatial_distribution.csv \
+  --split-manifest data/storm_split.csv \
   --weathernext-token-dir data/weathernext_tokens
 ```
 
@@ -403,6 +408,7 @@ build-gpt-state-cache \
 train-weathernext-transformer \
   --integrated data/integrated_typhoon_pressure.parquet \
   --distribution data/distribution/spatial_distribution.csv \
+  --split-manifest data/storm_split.csv \
   --weathernext-token-dir data/weathernext_tokens \
   --gpt-state-dir data/gpt_states
 ```
@@ -429,6 +435,17 @@ evaluate-ibtracs-predictions \
 ```
 
 기본 track metric은 great-circle mean error, RMSE, median, 90 percentile과 maximum이며, 예측 파일에 기압·풍속 열이 있으면 bias, MAE, RMSE도 계산합니다. `lead_hours`가 있으면 lead-time별 결과를 추가로 생성합니다.
+
+```bash
+evaluate-weathernext-transformer \
+  --checkpoint checkpoints/weathernext_transformer.pt \
+  --integrated data/integrated_typhoon_pressure.parquet \
+  --weathernext-token-dir data/weathernext_tokens \
+  --gpt-state-dir data/gpt_states \
+  --split-manifest data/storm_split.csv \
+  --split test \
+  --output-dir evaluation/weathernext_test
+```
 
 ## 중요한 설계 조건
 

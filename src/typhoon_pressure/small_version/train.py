@@ -25,6 +25,46 @@ class TrainConfig:
     grad_clip_norm: float = 1.0
 
 
+DIAGNOSTIC_OUTPUTS = (
+    "effective_forecast_token_fraction", "effective_forecast_feature_fraction",
+    "gpt_history_conditioning_fraction", "gpt_forecast_router_active_fraction",
+    "gpt_forecast_token_gate_mean", "gpt_forecast_channel_gate_mean",
+    "distribution_process_std_mean", "distribution_initial_std_mean",
+    "distribution_sample_spread_deg", "weathernext_endpoint_fraction",
+    "weathernext_endpoint_residual_deg",
+)
+
+
+def forward_batch(model, tensors):
+    if "forecast_values" in tensors:
+        extra_state = {}
+        if "gpt_state_values" in tensors:
+            extra_state.update(gpt_state_values=tensors["gpt_state_values"], gpt_state_mask=tensors["gpt_state_mask"])
+        if "weathernext_endpoint_latlon" in tensors:
+            extra_state.update(
+                weathernext_endpoint_latlon=tensors["weathernext_endpoint_latlon"],
+                weathernext_endpoint_mask=tensors["weathernext_endpoint_mask"],
+            )
+        return model(
+            tensors["history"], tensors["history_mask"], tensors["forecast_values"],
+            tensors["forecast_feature_mask"], tensors["forecast_token_mask"],
+            tensors["forecast_positions"], **extra_state,
+        )
+    return model(tensors["history"], tensors["history_mask"])
+
+
+def _with_diagnostics(losses, outputs):
+    for metric in DIAGNOSTIC_OUTPUTS:
+        if metric in outputs:
+            losses[metric] = outputs[metric]
+    return losses
+
+
+def _accumulate(totals, losses, batch_size):
+    for key, value in losses.items():
+        totals[key] = totals.get(key, 0.0) + float(value.detach()) * batch_size
+
+
 def train_epoch(model, loader, optimizer, criterion, device: torch.device) -> dict[str, float]:
     model.train()
     totals: dict[str, float] = {}
@@ -32,44 +72,29 @@ def train_epoch(model, loader, optimizer, criterion, device: torch.device) -> di
     for batch in loader:
         tensors = {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
         optimizer.zero_grad(set_to_none=True)
-        if "forecast_values" in tensors:
-            extra_state = {}
-            if "gpt_state_values" in tensors:
-                extra_state = {
-                    "gpt_state_values": tensors["gpt_state_values"],
-                    "gpt_state_mask": tensors["gpt_state_mask"],
-                }
-            outputs = model(
-                tensors["history"],
-                tensors["history_mask"],
-                tensors["forecast_values"],
-                tensors["forecast_feature_mask"],
-                tensors["forecast_token_mask"],
-                tensors["forecast_positions"],
-                **extra_state,
-            )
-        else:
-            outputs = model(tensors["history"], tensors["history_mask"])
-        losses = criterion(outputs, tensors)
-        for metric in (
-            "effective_forecast_token_fraction",
-            "effective_forecast_feature_fraction",
-            "gpt_history_conditioning_fraction",
-            "gpt_forecast_router_active_fraction",
-            "gpt_forecast_token_gate_mean",
-            "gpt_forecast_channel_gate_mean",
-            "distribution_process_std_mean",
-            "distribution_sample_spread_deg",
-        ):
-            if metric in outputs:
-                losses[metric] = outputs[metric]
+        outputs = forward_batch(model, tensors)
+        losses = _with_diagnostics(criterion(outputs, tensors), outputs)
         losses["loss"].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         batch_size = tensors["history"].shape[0]
         examples += batch_size
-        for key, value in losses.items():
-            totals[key] = totals.get(key, 0.0) + float(value.detach()) * batch_size
+        _accumulate(totals, losses, batch_size)
+    return {key: value / max(examples, 1) for key, value in totals.items()}
+
+
+@torch.no_grad()
+def evaluate_epoch(model, loader, criterion, device: torch.device) -> dict[str, float]:
+    model.eval()
+    totals = {}
+    examples = 0
+    for batch in loader:
+        tensors = {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
+        outputs = forward_batch(model, tensors)
+        losses = _with_diagnostics(criterion(outputs, tensors), outputs)
+        batch_size = tensors["history"].shape[0]
+        examples += batch_size
+        _accumulate(totals, losses, batch_size)
     return {key: value / max(examples, 1) for key, value in totals.items()}
 
 

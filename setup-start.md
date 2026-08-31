@@ -328,6 +328,7 @@ GPT state를 포함하여 학습:
 train-weathernext-transformer \
   --integrated data/integrated_typhoon_pressure.parquet \
   --distribution data/distribution/spatial_distribution.csv \
+  --split-manifest data/storm_split.csv \
   --weathernext-token-dir data/weathernext_tokens \
   --gpt-state-dir data/gpt_states \
   --require-valid-gpt-states \
@@ -353,6 +354,7 @@ train-weathernext-transformer \
 train-weathernext-transformer \
   --integrated data/integrated_typhoon_pressure.parquet \
   --distribution data/distribution/spatial_distribution.csv \
+  --split-manifest data/storm_split.csv \
   --weathernext-token-dir data/weathernext_tokens \
   --epochs 10 \
   --batch-size 8 \
@@ -394,10 +396,16 @@ build-gpt-state-cache \
   --integrated data/integrated_typhoon_pressure.parquet \
   --output-dir data/gpt_states
 
-# 5. Fusion training
+# 5. Leakage-safe storm split
+build-storm-split \
+  --integrated data/integrated_typhoon_pressure.parquet \
+  --output data/storm_split.csv
+
+# 6. Fusion training
 train-weathernext-transformer \
   --integrated data/integrated_typhoon_pressure.parquet \
   --distribution data/distribution/spatial_distribution.csv \
+  --split-manifest data/storm_split.csv \
   --weathernext-token-dir data/weathernext_tokens \
   --gpt-state-dir data/gpt_states \
   --require-valid-gpt-states \

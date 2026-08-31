@@ -11,13 +11,12 @@ from .config import DistributionSamplingConfig, SmallModelConfig
 
 
 class AdaptiveDistributionSampler(nn.Module):
-    """Kalman-inspired adaptive process-noise sampler for day 15--30.
+    """WeatherNext-anchored sampler with separate P_15 and transition Q_t.
 
     This is a process model rather than a full Kalman measurement update. The
     routed WeatherNext/fusion representation acts as the dynamical prior and a
-    learned positive-definite Q_t controls uncertainty growth. When GPT state
-    is present it explicitly conditions Q_t, so semantic confidence and track
-    uncertainty can change the sampled spread.
+    learned positive-definite initial covariance P_15 represents endpoint
+    uncertainty, while Q_t controls uncertainty growth after day 15.
 
     One sample index is propagated recursively through every lead day. The
     output therefore represents K coherent stochastic trajectories instead of
@@ -38,7 +37,9 @@ class AdaptiveDistributionSampler(nn.Module):
         self.gpt_state_dim = gpt_state_dim
         self.config = sampling_config
 
-        self.initial_state_head = nn.Linear(model_dim, 2)
+        self.fallback_state_head = nn.Linear(model_dim, 2)
+        self.initial_residual_head = nn.Linear(model_dim, 2)
+        self.initial_covariance_head = nn.Linear(model_dim, 3)
         self.drift_head = nn.Linear(model_dim, 2)
         self.process_noise_head = nn.Linear(model_dim, 3)
         self.gpt_noise_context = None
@@ -53,8 +54,10 @@ class AdaptiveDistributionSampler(nn.Module):
         # Start with modest uncorrelated Q_t. The diagonal raw parameters are
         # negative (small std), while rho starts exactly at zero.
         nn.init.zeros_(self.process_noise_head.weight)
+        nn.init.zeros_(self.initial_covariance_head.weight)
         with torch.no_grad():
             self.process_noise_head.bias.copy_(torch.tensor([-2.0, 0.0, -2.0]))
+            self.initial_covariance_head.bias.copy_(torch.tensor([-2.0, 0.0, -2.0]))
 
         lat_centres = -90.0 + (
             torch.arange(model_config.n_lat, dtype=torch.float32) + 0.5
@@ -83,11 +86,11 @@ class AdaptiveDistributionSampler(nn.Module):
         context = self.gpt_noise_context(torch.cat((masked, gpt_state_mask), dim=-1))
         return context.unsqueeze(1) * available.unsqueeze(1)
 
-    def _cholesky(self, condition: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        raw = self.process_noise_head(condition)
-        span = self.config.max_process_std_deg - self.config.min_process_std_deg
-        std_lat = self.config.min_process_std_deg + span * torch.sigmoid(raw[..., 0])
-        std_lon = self.config.min_process_std_deg + span * torch.sigmoid(raw[..., 2])
+    @staticmethod
+    def _bounded_cholesky(raw, minimum_std, maximum_std):
+        span = maximum_std - minimum_std
+        std_lat = minimum_std + span * torch.sigmoid(raw[..., 0])
+        std_lon = minimum_std + span * torch.sigmoid(raw[..., 2])
         rho = 0.95 * torch.tanh(raw[..., 1])
         residual = torch.sqrt((1.0 - rho.square()).clamp_min(1e-5))
 
@@ -128,6 +131,8 @@ class AdaptiveDistributionSampler(nn.Module):
         future_states: torch.Tensor,
         gpt_state_values: torch.Tensor | None = None,
         gpt_state_mask: torch.Tensor | None = None,
+        weathernext_endpoint_latlon: torch.Tensor | None = None,
+        weathernext_endpoint_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if future_states.ndim != 3:
             raise ValueError("future_states must have shape [batch, lead, model_dim]")
@@ -137,22 +142,59 @@ class AdaptiveDistributionSampler(nn.Module):
         condition = future_states + self._gpt_context(
             future_states, gpt_state_values, gpt_state_mask
         )
-        chol, covariance = self._cholesky(condition)
+        initial_chol, initial_covariance = self._bounded_cholesky(
+            self.initial_covariance_head(condition[:, 0]),
+            self.config.min_initial_std_deg,
+            self.config.max_initial_std_deg,
+        )
+        process_chol, process_covariance = self._bounded_cholesky(
+            self.process_noise_head(condition),
+            self.config.min_process_std_deg,
+            self.config.max_process_std_deg,
+        )
+        process_chol = process_chol.clone()
+        process_covariance = process_covariance.clone()
+        process_chol[:, 0] = 0.0
+        process_covariance[:, 0] = 0.0
 
-        initial_unit = torch.sigmoid(self.initial_state_head(future_states[:, 0]))
-        initial_mean = torch.stack((
-            -90.0 + 180.0 * initial_unit[..., 0],
-            360.0 * initial_unit[..., 1],
+        fallback_unit = torch.sigmoid(self.fallback_state_head(future_states[:, 0]))
+        fallback_mean = torch.stack((
+            -90.0 + 180.0 * fallback_unit[..., 0],
+            360.0 * fallback_unit[..., 1],
         ), dim=-1)
+        if weathernext_endpoint_latlon is None:
+            anchor = fallback_mean
+            endpoint_available = torch.zeros(
+                future_states.shape[0], dtype=future_states.dtype, device=future_states.device
+            )
+        else:
+            if weathernext_endpoint_latlon.shape != fallback_mean.shape:
+                raise ValueError("weathernext_endpoint_latlon must have shape [batch, 2]")
+            if weathernext_endpoint_mask is None:
+                raise ValueError("weathernext_endpoint_mask is required with endpoint coordinates")
+            endpoint_available = weathernext_endpoint_mask.to(future_states.dtype).reshape(-1)
+            anchor = torch.where(
+                endpoint_available.bool().unsqueeze(-1),
+                weathernext_endpoint_latlon.to(future_states.dtype), fallback_mean,
+            )
+        initial_residual = self.config.max_initial_correction_deg * torch.tanh(
+            self.initial_residual_head(future_states[:, 0])
+        )
+        initial_mean = self._wrap_state(anchor + initial_residual)
         daily_scale = self.config.max_daily_displacement_deg * self.model_config.distribution_step_days
         drift = daily_scale * torch.tanh(self.drift_head(future_states))
         drift = drift.clone()
         drift[:, 0] = 0.0
 
-        means = [self._wrap_state(initial_mean)]
+        means = [initial_mean]
         for lead in range(1, future_states.shape[1]):
             means.append(self._wrap_state(means[-1] + drift[:, lead]))
         mean_latlon = torch.stack(means, dim=1)
+
+        marginal_covariances = [initial_covariance]
+        for lead in range(1, future_states.shape[1]):
+            marginal_covariances.append(marginal_covariances[-1] + process_covariance[:, lead])
+        marginal_covariance = torch.stack(marginal_covariances, dim=1)
 
         batch, leads, _ = mean_latlon.shape
         samples = []
@@ -163,10 +205,11 @@ class AdaptiveDistributionSampler(nn.Module):
                 dtype=future_states.dtype,
                 device=future_states.device,
             )
-            noise = torch.einsum("bij,bkj->bki", chol[:, lead], epsilon)
             if lead == 0:
+                noise = torch.einsum("bij,bkj->bki", initial_chol, epsilon)
                 current = mean_latlon[:, 0].unsqueeze(1) + noise
             else:
+                noise = torch.einsum("bij,bkj->bki", process_chol[:, lead], epsilon)
                 current = previous + drift[:, lead].unsqueeze(1) + noise
             current = self._wrap_state(current)
             samples.append(current)
@@ -176,13 +219,21 @@ class AdaptiveDistributionSampler(nn.Module):
 
         return {
             "distribution_mean_latlon": mean_latlon,
-            "distribution_process_cholesky": chol,
-            "distribution_process_covariance": covariance,
+            "distribution_initial_cholesky": initial_chol,
+            "distribution_initial_covariance": initial_covariance,
+            "distribution_process_cholesky": process_chol,
+            "distribution_process_covariance": process_covariance,
+            "distribution_marginal_covariance": marginal_covariance,
             "distribution_samples": sample_trajectories,
             "distribution_probabilities": probabilities,
             "distribution_log_probabilities": log_probabilities,
             "distribution_process_std_mean": torch.sqrt(
-                covariance.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12)
+                process_covariance[:, 1:].diagonal(dim1=-2, dim2=-1).clamp_min(1e-12)
+            ).mean().detach() if leads > 1 else torch.zeros((), device=future_states.device),
+            "distribution_initial_std_mean": torch.sqrt(
+                initial_covariance.diagonal(dim1=-2, dim2=-1).clamp_min(1e-12)
             ).mean().detach(),
             "distribution_sample_spread_deg": sample_trajectories.std(dim=1).mean().detach(),
+            "weathernext_endpoint_fraction": endpoint_available.mean().detach(),
+            "weathernext_endpoint_residual_deg": initial_residual.norm(dim=-1).mean().detach(),
         }

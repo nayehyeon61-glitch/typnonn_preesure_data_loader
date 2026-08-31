@@ -80,6 +80,9 @@ def test_weathernext_output_reaches_masked_transformer(tmp_path):
     assert outputs["distribution_logits"].shape == (1, 2, 4)
     assert outputs["gpt_history_conditioning_fraction"].item() == 0.0
     assert outputs["gpt_forecast_router_active_fraction"].item() == 0.0
+    assert torch.all(outputs["survival_probability"][:, 1:] <= outputs["survival_probability"][:, :-1])
+    total_mass = outputs["distribution_unconditional_probabilities"].sum(dim=-1) + outputs["no_storm_probability"]
+    assert torch.allclose(total_mass, torch.ones_like(total_mass), atol=1e-5)
     assert torch.allclose(outputs["gpt_forecast_token_gate"], torch.ones_like(outputs["gpt_forecast_token_gate"]))
     assert torch.allclose(outputs["gpt_forecast_channel_gate"], torch.ones_like(outputs["gpt_forecast_channel_gate"]))
     assert torch.isfinite(losses["loss"])
@@ -120,6 +123,27 @@ def test_weathernext_output_reaches_masked_transformer(tmp_path):
     assert not torch.allclose(
         conditioned_outputs["distribution_logits"], unconditioned_outputs["distribution_logits"]
     )
+
+
+def test_tokenizer_tracks_local_mslp_minimum_and_persists_endpoint(tmp_path):
+    init_time = pd.Timestamp("2025-01-01")
+    times = pd.date_range(init_time + pd.Timedelta(days=14), periods=2, freq="24h")
+    lat, lon = np.asarray([10.0, 20.0, 30.0]), np.asarray([120.0, 130.0, 140.0])
+    pressure = np.full((2, 3, 3), 1010.0)
+    pressure[0, 1, 1], pressure[1, 2, 2] = 980.0, 975.0
+    shape = pressure.shape
+    forecast = xr.Dataset({
+        "msl": (("time", "latitude", "longitude"), pressure),
+        "u10": (("time", "latitude", "longitude"), np.ones(shape)),
+        "v10": (("time", "latitude", "longitude"), np.ones(shape)),
+        "t2m": (("time", "latitude", "longitude"), np.ones(shape) * 290.0),
+    }, coords={"time": times, "latitude": lat, "longitude": lon})
+    tokens = WeatherNextForecastTokenizer(WeatherNextTokenConfig(max_time_steps=2, target_lat_tokens=3, target_lon_tokens=3))(forecast, init_time, tracker_seed_latlon=(20.0, 130.0))
+    assert tokens.endpoint_mask and tokens.endpoint_lead_hours == 360.0
+    assert np.allclose(tokens.endpoint_latlon, [30.0, 140.0])
+    save_forecast_tokens(tokens, tmp_path, storm_id="TRACK", init_time=init_time)
+    loaded = DirectoryForecastTokenStore(tmp_path).load("TRACK", int(init_time.value))
+    assert loaded.endpoint_mask and np.allclose(loaded.endpoint_latlon, [30.0, 140.0])
 
 
 def test_gpt_forecast_router_is_identity_then_learns_nonuniform_gates():

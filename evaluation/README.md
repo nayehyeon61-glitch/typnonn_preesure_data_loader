@@ -1,8 +1,25 @@
-# IBTrACS-only Evaluation
+# Storm-level Probabilistic Evaluation
 
 첫 evaluation 단계는 외부 모델 간 비교 없이, 모델 예측을 IBTrACS 관측과 직접 비교합니다.
 
 실제 구현은 [`src/typhoon_pressure/evaluation/`](../src/typhoon_pressure/evaluation/)에 있습니다.
+
+```bash
+build-storm-split \
+  --integrated data/integrated_typhoon_pressure.parquet \
+  --output data/storm_split.csv
+
+evaluate-weathernext-transformer \
+  --checkpoint checkpoints/weathernext_transformer.pt \
+  --integrated data/integrated_typhoon_pressure.parquet \
+  --weathernext-token-dir data/weathernext_tokens \
+  --gpt-state-dir data/gpt_states \
+  --split-manifest data/storm_split.csv \
+  --split test \
+  --output-dir evaluation/weathernext_test
+```
+
+전체·lead별·storm별 NLL, Energy Score, coverage, sharpness, survival score와 단기 track error를 저장합니다. train/validation storm과 test storm이 겹치면 평가를 중단합니다.
 
 ## Prediction contract
 

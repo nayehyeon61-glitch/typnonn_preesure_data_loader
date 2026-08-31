@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +30,9 @@ class ForecastTokens:
     token_mask: np.ndarray
     positions: np.ndarray
     feature_names: tuple[str, ...]
+    endpoint_latlon: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
+    endpoint_mask: bool = False
+    endpoint_lead_hours: float = 0.0
 
     def validate(self) -> None:
         if self.values.ndim != 2:
@@ -42,6 +45,12 @@ class ForecastTokens:
             raise ValueError("positions must have shape [tokens, 6]")
         if len(self.feature_names) != self.values.shape[1]:
             raise ValueError("feature_names must match token feature dimension")
+        if np.asarray(self.endpoint_latlon).shape != (2,):
+            raise ValueError("endpoint_latlon must have shape [2]")
+        if self.endpoint_mask and not np.isfinite(self.endpoint_latlon).all():
+            raise ValueError("available endpoint_latlon must be finite")
+        if self.endpoint_mask and self.endpoint_lead_hours <= 0:
+            raise ValueError("available endpoint must have a positive lead time")
         if not np.isfinite(self.values).all():
             raise ValueError("token values contain non-finite entries")
         if not np.isfinite(self.positions).all():
@@ -95,13 +104,62 @@ def _resolve_required_variables(dataset: xr.Dataset, requested: tuple[str, ...])
     return resolved
 
 
+def _track_cyclone_endpoint(
+    forecast: xr.Dataset,
+    *,
+    time_name: str,
+    lat_name: str,
+    lon_name: str,
+    tracker_seed_latlon: tuple[float, float] | None,
+    search_radius_deg: float = 15.0,
+) -> tuple[np.ndarray, bool]:
+    if tracker_seed_latlon is None:
+        return np.zeros(2, dtype=np.float32), False
+    pressure_name = next((name for name in ("mean_sea_level_pressure", "msl", "mslp") if name in forecast), None)
+    if pressure_name is None:
+        return np.zeros(2, dtype=np.float32), False
+    latitudes = np.asarray(forecast[lat_name].values, dtype=float)
+    longitudes = np.mod(np.asarray(forecast[lon_name].values, dtype=float), 360.0)
+    previous_lat = float(tracker_seed_latlon[0])
+    previous_lon = float(tracker_seed_latlon[1]) % 360.0
+    if not np.isfinite((previous_lat, previous_lon)).all():
+        return np.zeros(2, dtype=np.float32), False
+    lon_grid, lat_grid = np.meshgrid(longitudes, latitudes)
+    tracked = False
+    for time_index in range(forecast.sizes[time_name]):
+        field_values = forecast[pressure_name].isel({time_name: time_index})
+        if set(field_values.dims).difference({lat_name, lon_name}):
+            return np.zeros(2, dtype=np.float32), False
+        field = np.asarray(field_values.transpose(lat_name, lon_name).values, dtype=float)
+        dlon = (lon_grid - previous_lon + 180.0) % 360.0 - 180.0
+        distance = np.sqrt((lat_grid - previous_lat) ** 2 + (dlon * np.cos(np.deg2rad(previous_lat))) ** 2)
+        local = np.isfinite(field) & (distance <= search_radius_deg)
+        if not local.any():
+            continue
+        local_values = field[local]
+        if np.nanmax(local_values) - np.nanmin(local_values) <= 1e-8:
+            tracked = True
+            continue
+        candidate = np.where(local, field, np.inf)
+        lat_index, lon_index = np.unravel_index(np.argmin(candidate), candidate.shape)
+        previous_lat = float(latitudes[lat_index])
+        previous_lon = float(longitudes[lon_index])
+        tracked = True
+    return np.asarray([previous_lat, previous_lon], dtype=np.float32), tracked
+
+
 class WeatherNextForecastTokenizer:
     """Patch-pool 0–15 day global fields using one canonical feature schema."""
 
     def __init__(self, config: WeatherNextTokenConfig = WeatherNextTokenConfig()):
         self.config = config
 
-    def __call__(self, forecast: xr.Dataset, init_time) -> ForecastTokens:
+    def __call__(
+        self,
+        forecast: xr.Dataset,
+        init_time,
+        tracker_seed_latlon: tuple[float, float] | None = None,
+    ) -> ForecastTokens:
         time_name = _coordinate_name(forecast, ("time", "valid_time", "datetime"))
         lat_name = _coordinate_name(forecast, ("latitude", "lat"))
         lon_name = _coordinate_name(forecast, ("longitude", "lon"))
@@ -118,6 +176,13 @@ class WeatherNextForecastTokenizer:
             valid_times = valid_times[chosen]
         selected = selected.isel({time_name: valid_times})
         lead_hours = lead_hours[valid_times]
+        endpoint_latlon, endpoint_mask = _track_cyclone_endpoint(
+            selected,
+            time_name=time_name,
+            lat_name=lat_name,
+            lon_name=lon_name,
+            tracker_seed_latlon=tracker_seed_latlon,
+        )
 
         lat_factor = max(1, int(np.ceil(selected.sizes[lat_name] / self.config.target_lat_tokens)))
         lon_factor = max(1, int(np.ceil(selected.sizes[lon_name] / self.config.target_lon_tokens)))
@@ -170,6 +235,9 @@ class WeatherNextForecastTokenizer:
             token_mask=token_mask.astype(np.float32),
             positions=positions.reshape(-1, 6),
             feature_names=tuple(self.config.variables),
+            endpoint_latlon=endpoint_latlon,
+            endpoint_mask=endpoint_mask,
+            endpoint_lead_hours=float(lead_hours[-1]) if endpoint_mask else 0.0,
         )
         result.validate()
         return result
@@ -251,6 +319,9 @@ def save_forecast_tokens(
                 token_mask=tokens.token_mask,
                 positions=tokens.positions,
                 feature_names=np.asarray(tokens.feature_names),
+                endpoint_latlon=tokens.endpoint_latlon,
+                endpoint_mask=np.asarray(tokens.endpoint_mask, dtype=np.bool_),
+                endpoint_lead_hours=np.asarray(tokens.endpoint_lead_hours, dtype=np.float32),
             )
         with np.load(temp_npz, allow_pickle=False) as data:
             if set(("values", "feature_mask", "token_mask", "positions", "feature_names")).difference(data.files):
@@ -269,7 +340,13 @@ def save_forecast_tokens(
 def run_and_save_weathernext_tokens(runner, request, tokenizer: WeatherNextForecastTokenizer, output_dir: str | Path) -> Path:
     from typhoon_pressure.weathernext_adapter import run_weathernext
     forecast = run_weathernext(runner, request)
-    tokens = tokenizer(forecast, request.tracker_seed["time"])
+    tokens = tokenizer(
+        forecast,
+        request.tracker_seed["time"],
+        tracker_seed_latlon=(
+            float(request.tracker_seed["lat"]), float(request.tracker_seed["lon"])
+        ),
+    )
     return save_forecast_tokens(tokens, output_dir, storm_id=request.tracker_seed["storm_id"], init_time=request.tracker_seed["time"])
 
 
@@ -340,6 +417,15 @@ class DirectoryForecastTokenStore:
                 token_mask=data["token_mask"].astype(np.float32),
                 positions=data["positions"].astype(np.float32),
                 feature_names=tuple(str(value) for value in data["feature_names"]),
+                endpoint_latlon=(
+                    data["endpoint_latlon"].astype(np.float32)
+                    if "endpoint_latlon" in data.files else np.zeros(2, dtype=np.float32)
+                ),
+                endpoint_mask=(bool(data["endpoint_mask"].item()) if "endpoint_mask" in data.files else False),
+                endpoint_lead_hours=(
+                    float(data["endpoint_lead_hours"].item())
+                    if "endpoint_lead_hours" in data.files else 0.0
+                ),
             )
         result.validate()
         return result

@@ -57,6 +57,9 @@ class TyphoonPressureDataset(Dataset):
     def __len__(self):
         return len(self.windows)
 
+    def storm_id_at(self, index: int) -> str:
+        return str(self.windows[index][0])
+
     def __getitem__(self, index):
         storm_id, start = self.windows[index]
         frame = self.groups[storm_id].iloc[start : start + self.history + self.horizon]

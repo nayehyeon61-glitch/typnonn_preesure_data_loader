@@ -59,3 +59,19 @@ def test_dual_targets_model_and_loss():
     losses["loss"].backward()
     assert any(parameter.grad is not None for parameter in model.parameters())
 
+
+def test_long_range_targets_are_same_storm_and_no_storm_is_absorbing():
+    times = pd.date_range("2025-01-01", periods=70, freq="6h")
+    integrated = pd.DataFrame({
+        "storm_id": ["LONG"] * len(times), "time": times,
+        "typhoon_lat": np.linspace(10, 30, len(times)), "typhoon_lon": np.linspace(120, 150, len(times)),
+        "typhoon_pressure_hpa": np.linspace(1000, 970, len(times)), "typhoon_wind_kt": np.linspace(20, 60, len(times)),
+        "high_rank": [1] * len(times), "high_dx_km": [500.0] * len(times), "high_dy_km": [600.0] * len(times),
+        "high_pressure_hpa": [1020.0] * len(times), "high_anomaly_hpa": [5.0] * len(times),
+    })
+    base = TyphoonPressureDataset(integrated, history=3, horizon=4, max_highs=1)
+    config = SmallModelConfig(input_dim=len(base.feature_cols), history_steps=3, hidden_dim=8, distribution_start_day=15, distribution_end_day=18, local_track_steps=4, lat_bin_deg=30, lon_bin_deg=60)
+    sample = DualTargetDataset(base, None, config)[0]
+    assert torch.equal(sample["future_alive_target"], torch.tensor([1.0, 1.0, 0.0, 0.0]))
+    assert torch.equal(sample["future_alive_mask"], torch.ones(4))
+    assert torch.equal(sample["future_track_mask"], torch.tensor([1.0, 1.0, 0.0, 0.0]))

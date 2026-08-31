@@ -29,6 +29,8 @@ tokenize-weathernext-output = "typhoon_pressure.small_version.tokenize_weatherne
 train-weathernext-transformer = "typhoon_pressure.small_version.train_transformer:main"
 build-gpt-state-cache = "typhoon_pressure.small_version.build_gpt_state_cache:main"
 evaluate-ibtracs-predictions = "typhoon_pressure.evaluation.ibtracs:main"
+build-storm-split = "typhoon_pressure.evaluation.storm_split:main"
+evaluate-weathernext-transformer = "typhoon_pressure.evaluation.weathernext:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

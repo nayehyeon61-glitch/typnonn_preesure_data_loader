@@ -57,16 +57,19 @@ class SpatialDistributionLookup:
 
 
 class DualTargetDataset(Dataset):
-    """Add global distribution and East-Asia local-track targets to the base dataset."""
+    """Add same-storm long-range positions, survival and local-track targets."""
 
     def __init__(
         self,
         base_dataset: Dataset,
-        distribution: SpatialDistributionLookup,
+        distribution: SpatialDistributionLookup | None,
         model_config: SmallModelConfig,
         bounds: EastAsiaBounds = EastAsiaBounds(),
     ):
-        if distribution.n_lat != model_config.n_lat or distribution.n_lon != model_config.n_lon:
+        if distribution is not None and (
+            distribution.n_lat != model_config.n_lat
+            or distribution.n_lon != model_config.n_lon
+        ):
             raise ValueError("Distribution grid and model grid do not match")
         self.base = base_dataset
         self.distribution = distribution
@@ -76,13 +79,64 @@ class DualTargetDataset(Dataset):
     def __len__(self):
         return len(self.base)
 
+    def storm_id_at(self, index: int) -> str:
+        if hasattr(self.base, "storm_id_at"):
+            return str(self.base.storm_id_at(index))
+        if hasattr(self.base, "windows"):
+            return str(self.base.windows[index][0])
+        return str(self.base[index]["storm_id"])
+
+    def _storm_future_targets(self, storm_id: str, init_time_ns: int):
+        if not hasattr(self.base, "groups") or str(storm_id) not in self.base.groups:
+            raise ValueError("Base dataset must expose complete per-storm groups")
+        group = self.base.groups[str(storm_id)]
+        times = pd.DatetimeIndex(group["time"])
+        lat = pd.to_numeric(group["typhoon_lat"], errors="coerce").to_numpy(float)
+        lon = pd.to_numeric(group["typhoon_lon"], errors="coerce").to_numpy(float)
+        valid_fix = np.isfinite(lat) & np.isfinite(lon)
+        if not valid_fix.any():
+            raise ValueError(f"Storm {storm_id!r} has no valid track positions")
+        fix_by_time = {
+            int(time.value): (float(lat[i]), float(lon[i]))
+            for i, time in enumerate(times) if valid_fix[i]
+        }
+        final_fix_ns = max(fix_by_time)
+        init_time = pd.Timestamp(init_time_ns, unit="ns")
+        leads = len(self.config.lead_days)
+        positions = np.zeros((leads, 2), dtype=np.float32)
+        position_mask = np.zeros(leads, dtype=np.float32)
+        alive = np.zeros(leads, dtype=np.float32)
+        alive_mask = np.zeros(leads, dtype=np.float32)
+        grid = np.zeros((leads, self.config.n_cells), dtype=np.float32)
+        for index, lead_day in enumerate(self.config.lead_days):
+            target_ns = int((init_time + pd.Timedelta(days=lead_day)).value)
+            if target_ns in fix_by_time:
+                target_lat, target_lon = fix_by_time[target_ns]
+                positions[index] = (target_lat, target_lon)
+                position_mask[index] = 1.0
+                alive[index] = 1.0
+                alive_mask[index] = 1.0
+                lat_bin = int(np.floor((target_lat + 90.0) / self.config.lat_bin_deg))
+                lon_bin = int(np.floor((target_lon % 360.0) / self.config.lon_bin_deg))
+                lat_bin = int(np.clip(lat_bin, 0, self.config.n_lat - 1))
+                lon_bin = int(np.clip(lon_bin, 0, self.config.n_lon - 1))
+                grid[index, lat_bin * self.config.n_lon + lon_bin] = 1.0
+            elif target_ns > final_fix_ns:
+                alive_mask[index] = 1.0
+        return positions, position_mask, alive, alive_mask, grid
+
     def __getitem__(self, index):
         sample = self.base[index]
         if sample["target"].shape[0] != self.config.local_track_steps:
             raise ValueError("Base dataset horizon must equal local_track_steps")
-        distribution_target, distribution_mask = self.distribution.targets(
-            sample["init_time_ns"], self.config.lead_days
-        )
+        (
+            future_track_target,
+            future_track_mask,
+            future_alive_target,
+            future_alive_mask,
+            distribution_target,
+        ) = self._storm_future_targets(sample["storm_id"], sample["init_time_ns"])
+        distribution_mask = future_track_mask.copy()
         track = sample["target"][:, :2]
         valid = sample["target_mask"][:, :2].all(dim=-1)
         lon360 = torch.remainder(track[:, 1], 360.0)
@@ -95,6 +149,10 @@ class DualTargetDataset(Dataset):
             "history_mask": sample["history_mask"],
             "distribution_target": torch.from_numpy(distribution_target),
             "distribution_mask": torch.from_numpy(distribution_mask),
+            "future_track_target": torch.from_numpy(future_track_target),
+            "future_track_mask": torch.from_numpy(future_track_mask),
+            "future_alive_target": torch.from_numpy(future_alive_target),
+            "future_alive_mask": torch.from_numpy(future_alive_mask),
             "track_target": track,
             "track_mask": (valid & in_domain).to(torch.float32),
             "storm_id": sample["storm_id"],
@@ -108,26 +166,35 @@ class WeatherNextDualTargetDataset(DualTargetDataset):
     def __init__(
         self,
         base_dataset: Dataset,
-        distribution: SpatialDistributionLookup,
+        distribution: SpatialDistributionLookup | None,
         model_config: SmallModelConfig,
         forecast_store: DirectoryForecastTokenStore,
         *,
         max_forecast_tokens: int,
         forecast_input_dim: int,
         bounds: EastAsiaBounds = EastAsiaBounds(),
+        require_endpoint_lead_hours: float | None = None,
     ):
         super().__init__(base_dataset, distribution, model_config, bounds)
         self.forecast_store = forecast_store
         self.max_forecast_tokens = max_forecast_tokens
         self.forecast_input_dim = forecast_input_dim
+        self.require_endpoint_lead_hours = require_endpoint_lead_hours
         self.indices = []
         for index in range(len(self.base)):
             sample = self.base[index]
             if self.forecast_store.contains(sample["storm_id"], sample["init_time_ns"]):
+                if require_endpoint_lead_hours is not None:
+                    tokens = self.forecast_store.load(sample["storm_id"], sample["init_time_ns"])
+                    if not tokens.endpoint_mask or tokens.endpoint_lead_hours + 1e-6 < require_endpoint_lead_hours:
+                        continue
                 self.indices.append(index)
 
     def __len__(self):
         return len(self.indices)
+
+    def storm_id_at(self, index: int) -> str:
+        return super().storm_id_at(self.indices[index])
 
     def __getitem__(self, index):
         base_index = self.indices[index]
@@ -152,5 +219,8 @@ class WeatherNextDualTargetDataset(DualTargetDataset):
             "forecast_feature_mask": torch.from_numpy(feature_mask),
             "forecast_token_mask": torch.from_numpy(token_mask),
             "forecast_positions": torch.from_numpy(positions),
+            "weathernext_endpoint_latlon": torch.from_numpy(tokens.endpoint_latlon),
+            "weathernext_endpoint_mask": torch.tensor(tokens.endpoint_mask, dtype=torch.float32),
+            "weathernext_endpoint_lead_hours": torch.tensor(tokens.endpoint_lead_hours, dtype=torch.float32),
         })
         return sample

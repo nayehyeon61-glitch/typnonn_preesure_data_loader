@@ -157,6 +157,7 @@ build-gpt-state-cache \
 train-weathernext-transformer \
   --integrated data/integrated.parquet \
   --distribution data/spatial_distribution.csv \
+  --split-manifest data/storm_split.csv \
   --weathernext-token-dir data/weathernext_tokens \
   --gpt-state-dir data/gpt_states \
   --require-valid-gpt-states \

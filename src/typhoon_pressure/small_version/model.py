@@ -199,6 +199,7 @@ class WeatherNextFusionTransformer(nn.Module):
             gpt_state_dim=transformer_config.gpt_state_dim,
             sampling_config=sampling_config,
         )
+        self.survival_hazard_head = nn.Linear(transformer_config.model_dim, 1)
         self.track_head = nn.Linear(hidden, model_config.local_track_steps * 2)
 
     def _apply_input_mask(
@@ -227,6 +228,8 @@ class WeatherNextFusionTransformer(nn.Module):
         forecast_positions: torch.Tensor,
         gpt_state_values: torch.Tensor | None = None,
         gpt_state_mask: torch.Tensor | None = None,
+        weathernext_endpoint_latlon: torch.Tensor | None = None,
+        weathernext_endpoint_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         masked_history = torch.where(history_mask.bool(), history, torch.zeros_like(history))
         history_input = self.history_projection(torch.cat((masked_history, history_mask), dim=-1))
@@ -293,7 +296,14 @@ class WeatherNextFusionTransformer(nn.Module):
             future_states,
             gpt_state_values=gpt_state_values,
             gpt_state_mask=gpt_state_mask,
+            weathernext_endpoint_latlon=weathernext_endpoint_latlon,
+            weathernext_endpoint_mask=weathernext_endpoint_mask,
         )
+        survival_hazard_logits = self.survival_hazard_head(future_states).squeeze(-1)
+        log_survival_probability = torch.cumsum(
+            torch.nn.functional.logsigmoid(-survival_hazard_logits), dim=1
+        )
+        survival_probability = log_survival_probability.exp()
 
         raw_track = self.track_head(state).view(-1, self.model_config.local_track_steps, 2)
         unit_track = torch.sigmoid(raw_track)
@@ -302,6 +312,12 @@ class WeatherNextFusionTransformer(nn.Module):
         result = {
             "distribution_logits": distribution_logits,
             "track_latlon": torch.stack((lat, lon), dim=-1),
+            "survival_hazard_logits": survival_hazard_logits,
+            "survival_probability": survival_probability,
+            "no_storm_probability": 1.0 - survival_probability,
+            "distribution_unconditional_probabilities": (
+                sampling["distribution_probabilities"] * survival_probability.unsqueeze(-1)
+            ),
             "effective_forecast_token_fraction": effective_token_mask.float().mean().detach(),
             "effective_forecast_feature_fraction": effective_feature_mask.mean().detach(),
             **sampling,

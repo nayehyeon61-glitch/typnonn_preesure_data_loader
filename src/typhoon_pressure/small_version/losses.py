@@ -7,6 +7,40 @@ from torch.nn import functional as F
 from .config import DualLossConfig
 
 
+def storm_trajectory_gaussian_nll(
+    mean_latlon: torch.Tensor,
+    covariance: torch.Tensor,
+    target_latlon: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    lat_error = target_latlon[..., 0] - mean_latlon[..., 0]
+    lon_error = torch.remainder(target_latlon[..., 1] - mean_latlon[..., 1] + 180.0, 360.0) - 180.0
+    residual = torch.stack((lat_error, lon_error), dim=-1)
+    eye = torch.eye(2, dtype=covariance.dtype, device=covariance.device)
+    stable_covariance = covariance + 1e-4 * eye
+    solved = torch.linalg.solve(stable_covariance, residual.unsqueeze(-1)).squeeze(-1)
+    mahalanobis = (residual * solved).sum(dim=-1)
+    sign, logdet = torch.linalg.slogdet(stable_covariance)
+    if not torch.all(sign > 0):
+        raise ValueError("Trajectory covariance must be positive definite")
+    per_lead = 0.5 * (mahalanobis + logdet + 2.0 * torch.log(
+        torch.tensor(2.0 * torch.pi, dtype=covariance.dtype, device=covariance.device)
+    ))
+    denominator = mask.sum()
+    if denominator.item() == 0:
+        return mean_latlon.sum() * 0.0
+    return (per_lead * mask).sum() / denominator
+
+
+def absorbing_survival_loss(probability, target, mask):
+    probability = probability.clamp(1e-6, 1.0 - 1e-6)
+    per_lead = F.binary_cross_entropy(probability, target, reduction="none")
+    denominator = mask.sum()
+    if denominator.item() == 0:
+        return probability.sum() * 0.0
+    return (per_lead * mask).sum() / denominator
+
+
 def soft_distribution_cross_entropy(
     logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
 ) -> torch.Tensor:
@@ -71,7 +105,18 @@ class DualObjectiveLoss(nn.Module):
         self.config = config
 
     def forward(self, outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]):
-        if "distribution_log_probabilities" in outputs:
+        if (
+            "distribution_mean_latlon" in outputs
+            and "distribution_marginal_covariance" in outputs
+            and "future_track_target" in batch
+        ):
+            distribution_loss = storm_trajectory_gaussian_nll(
+                outputs["distribution_mean_latlon"],
+                outputs["distribution_marginal_covariance"],
+                batch["future_track_target"],
+                batch["future_track_mask"],
+            )
+        elif "distribution_log_probabilities" in outputs:
             distribution_loss = sampled_distribution_cross_entropy(
                 outputs["distribution_log_probabilities"],
                 batch["distribution_target"],
@@ -86,13 +131,22 @@ class DualObjectiveLoss(nn.Module):
         track_loss, track_rmse_km = east_asia_track_error(
             outputs["track_latlon"], batch["track_target"], batch["track_mask"], self.config.track_scale_km
         )
+        if "survival_probability" in outputs and "future_alive_target" in batch:
+            survival_loss = absorbing_survival_loss(
+                outputs["survival_probability"], batch["future_alive_target"], batch["future_alive_mask"]
+            )
+        else:
+            survival_loss = track_loss * 0.0
         total = (
             self.config.distribution_weight * distribution_loss
             + self.config.local_track_weight * track_loss
+            + self.config.survival_weight * survival_loss
         )
         return {
             "loss": total,
             "distribution_ce": distribution_loss,
+            "distribution_nll": distribution_loss,
+            "survival_bce": survival_loss,
             "local_track_mse_normalized": track_loss,
             "local_track_rmse_km": track_rmse_km,
         }

@@ -50,6 +50,7 @@ class SmallModelConfig:
 class DualLossConfig:
     distribution_weight: float = 1.0
     local_track_weight: float = 1.0
+    survival_weight: float = 1.0
     track_scale_km: float = 500.0
 
 
@@ -66,6 +67,9 @@ class DistributionSamplingConfig:
     num_samples: int = 32
     min_process_std_deg: float = 0.25
     max_process_std_deg: float = 12.0
+    min_initial_std_deg: float = 0.25
+    max_initial_std_deg: float = 8.0
+    max_initial_correction_deg: float = 5.0
     max_daily_displacement_deg: float = 15.0
     grid_kernel_std_deg: float = 5.0
 
@@ -76,6 +80,12 @@ class DistributionSamplingConfig:
             raise ValueError("min_process_std_deg must be positive")
         if self.max_process_std_deg <= self.min_process_std_deg:
             raise ValueError("max_process_std_deg must exceed min_process_std_deg")
+        if self.min_initial_std_deg <= 0:
+            raise ValueError("min_initial_std_deg must be positive")
+        if self.max_initial_std_deg <= self.min_initial_std_deg:
+            raise ValueError("max_initial_std_deg must exceed min_initial_std_deg")
+        if self.max_initial_correction_deg < 0:
+            raise ValueError("max_initial_correction_deg must be non-negative")
         if self.max_daily_displacement_deg <= 0:
             raise ValueError("max_daily_displacement_deg must be positive")
         if self.grid_kernel_std_deg <= 0:

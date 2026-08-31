@@ -111,6 +111,10 @@ train-small-typhoon-model \
 WeatherNext 출력 파일을 Transformer token으로 변환하고 fusion model을 학습하려면:
 
 ```bash
+build-storm-split \
+  --integrated data/integrated_typhoon_pressure.parquet \
+  --output data/storm_split.csv
+
 tokenize-weathernext-output \
   --forecast data/weathernext/TEST_20250101.nc \
   --storm-id TEST \
@@ -120,11 +124,14 @@ tokenize-weathernext-output \
 train-weathernext-transformer \
   --integrated data/integrated_typhoon_pressure.parquet \
   --distribution data/distribution/spatial_distribution.csv \
+  --split-manifest data/storm_split.csv \
   --weathernext-token-dir data/weathernext_tokens \
   --gpt-state-dir data/gpt_states \
   --require-valid-gpt-states \
   --input-mask-probability 0.15 \
   --output checkpoints/weathernext_transformer.pt
 ```
+
+학습은 train storm만 갱신에 사용하고 validation total loss가 최소인 checkpoint를 저장합니다. test storm은 `evaluate-weathernext-transformer`에서만 사용합니다.
 
 `history=8`은 6시간 간격 48시간 입력이며, `track-steps=20`은 동아시아 경로 5일 target입니다. 전 지구 분포 head는 독립적으로 15일부터 30일까지 일 단위로 출력합니다.
