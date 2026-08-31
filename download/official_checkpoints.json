@@ -1,0 +1,27 @@
+{
+  "bucket": "gs://dm_graphcast",
+  "prefix": "weathernext2/params",
+  "release": "v0.3.0",
+  "defaults": {
+    "weathernext2": "WeatherNext2_<2025_model1.npz",
+    "cyclones": "WeatherNextCyclones_<2025_model1.npz",
+    "mini": "WeatherNextCyclones_Mini_<2024.npz"
+  },
+  "patterns": [
+    {
+      "model_variant": "WeatherNext2",
+      "filename": "WeatherNext2_<2025_model{1,2,3,4}.npz",
+      "resolution_degrees": 0.25
+    },
+    {
+      "model_variant": "WeatherNextCyclones",
+      "filename": "WeatherNextCyclones_<{2023,2024,2025}_model{1,2,3,4}.npz",
+      "resolution_degrees": 0.25
+    },
+    {
+      "model_variant": "WeatherNextCyclones_Mini",
+      "filename": "WeatherNextCyclones_Mini_<{2023,2024}.npz",
+      "resolution_degrees": 1.0
+    }
+  ]
+}

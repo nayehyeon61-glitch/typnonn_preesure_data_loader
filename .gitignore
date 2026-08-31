@@ -9,3 +9,7 @@ checkpoints/
 weather-me-fine_tune_weight*.npz
 weather-me-fine_tune_weight*.metrics.json
 weather-me-fine_tune_weight*.metadata.json
+download/*.npz
+download/*.npz.part
+download/*.metadata.json
+download/*.metadata.json.part

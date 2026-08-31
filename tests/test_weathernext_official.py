@@ -4,6 +4,7 @@ import pytest
 
 from typhoon_pressure.weathernext_official import (
     OfficialWeatherNextRunner,
+    _checkpoint_kind,
     _validate_checkpoint_metadata,
     resolve_model_spec,
 )
@@ -37,6 +38,14 @@ def test_checkpoint_metadata_rejects_wrong_architecture(tmp_path):
             resolve_model_spec("WeatherNext2"),
             "v0.3.0",
         )
+
+
+def test_fine_tune_metadata_is_classified_for_downstream_provenance():
+    assert _checkpoint_kind({"fine_tune_steps": 10}) == "fine_tuned"
+    assert _checkpoint_kind({"checkpoint_kind": "official_pretrained"}) == (
+        "official_pretrained"
+    )
+    assert _checkpoint_kind({}) == "pretrained_unknown"
 
 
 def test_official_runner_has_no_training_entry_point():

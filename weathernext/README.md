@@ -127,6 +127,33 @@ pip install -e '.[weathernext]'
 GPU에서는 실행 환경에 맞는 JAX CUDA wheel을 별도로 설치해야 합니다. 첫 rollout은
 JAX compile 때문에 오래 걸릴 수 있습니다.
 
+### 공식 weight 다운로드와 적용 검증
+
+```bash
+download-weathernext-checkpoint --model weathernext2
+```
+
+기본 저장 위치는 `download/`이며, checkpoint와 함께
+`checkpoint_kind=official_pretrained` metadata를 생성합니다. 이후
+`prepare-weathernext-tokens`로 rollout과 token cache를 만들면 해당 종류·모델·release·
+checkpoint 경로가 `manifest.csv`에 기록됩니다.
+
+후단 학습에서는 다음 옵션으로 입력 출처를 강제할 수 있습니다.
+
+```bash
+# 공식 pretrained 출력만 허용
+train-weathernext-transformer ... \
+  --require-checkpoint-kind official_pretrained
+
+# weather-me-fine_tune_weight 출력만 허용
+train-weathernext-transformer ... \
+  --require-checkpoint-kind fine_tuned
+```
+
+최종 PyTorch checkpoint에도 `weathernext_provenance`가 저장되므로, 학습이 공식
+pretrained 출력과 fine-tuned 출력 중 어느 쪽을 사용했는지 사후 확인할 수 있습니다.
+자세한 실행 순서는 [`../download/README.md`](../download/README.md)를 참고하십시오.
+
 ### 3. API 또는 managed forecast feed
 
 ```python

@@ -12,6 +12,15 @@ import xarray as xr
 
 from .config import WeatherNextTokenConfig
 
+PROVENANCE_FIELDS = (
+    "weathernext_backend",
+    "weathernext_model_id",
+    "weathernext_model_variant",
+    "weathernext_release",
+    "weathernext_checkpoint",
+    "weathernext_checkpoint_kind",
+)
+
 
 @dataclass(frozen=True)
 class ForecastTokens:
@@ -59,8 +68,8 @@ def _normalise_variable_names(dataset: xr.Dataset, requested: tuple[str, ...]) -
 class WeatherNextForecastTokenizer:
     """Patch-pool 0–15 day global fields and preserve feature/token validity masks."""
 
-    def __init__(self, config: WeatherNextTokenConfig = WeatherNextTokenConfig()):
-        self.config = config
+    def __init__(self, config: WeatherNextTokenConfig | None = None):
+        self.config = config or WeatherNextTokenConfig()
 
     def __call__(self, forecast: xr.Dataset, init_time) -> ForecastTokens:
         time_name = _coordinate_name(forecast, ("time", "valid_time", "datetime"))
@@ -150,6 +159,7 @@ def save_forecast_tokens(
     *,
     storm_id: str,
     init_time,
+    provenance: dict[str, object] | None = None,
 ) -> Path:
     """Persist one tokenized rollout and update the lookup manifest."""
     tokens.validate()
@@ -167,7 +177,16 @@ def save_forecast_tokens(
         feature_names=np.asarray(tokens.feature_names),
     )
     manifest = output / "manifest.csv"
-    row = pd.DataFrame([{"storm_id": str(storm_id), "init_time_ns": init_time_ns, "file": filename}])
+    row_data = {
+        "storm_id": str(storm_id),
+        "init_time_ns": init_time_ns,
+        "file": filename,
+    }
+    for field in PROVENANCE_FIELDS:
+        value = None if provenance is None else provenance.get(field)
+        if value is not None:
+            row_data[field] = str(value)
+    row = pd.DataFrame([row_data])
     if manifest.exists():
         current = pd.read_csv(manifest)
         keep = ~(
@@ -190,11 +209,17 @@ def run_and_save_weathernext_tokens(
 
     forecast = run_weathernext(runner, request)
     tokens = tokenizer(forecast, request.tracker_seed["time"])
+    provenance = {
+        field: forecast.attrs[field]
+        for field in PROVENANCE_FIELDS
+        if forecast.attrs.get(field) is not None
+    }
     return save_forecast_tokens(
         tokens,
         output_dir,
         storm_id=request.tracker_seed["storm_id"],
         init_time=request.tracker_seed["time"],
+        provenance=provenance,
     )
 
 
@@ -204,12 +229,44 @@ class DirectoryForecastTokenStore:
     def __init__(self, directory: str | Path):
         self.directory = Path(directory)
         manifest = pd.read_csv(self.directory / "manifest.csv")
+        self.manifest = manifest
         if manifest.duplicated(["storm_id", "init_time_ns"]).any():
             raise ValueError("WeatherNext token manifest has duplicate sample keys")
         self.files = {
             (str(row.storm_id), int(row.init_time_ns)): self.directory / str(row.file)
             for row in manifest.itertuples(index=False)
         }
+
+    def provenance(self) -> dict[str, str]:
+        """Return one consistent checkpoint identity for the token cache."""
+        result = {}
+        for field in PROVENANCE_FIELDS:
+            if field not in self.manifest:
+                continue
+            values = {
+                str(value)
+                for value in self.manifest[field].dropna().unique()
+                if str(value).strip()
+            }
+            if len(values) > 1:
+                raise ValueError(
+                    f"WeatherNext token cache mixes multiple {field} values: {sorted(values)}"
+                )
+            if values:
+                result[field] = values.pop()
+        return result
+
+    def require_checkpoint_kind(self, expected: str) -> None:
+        actual = self.provenance().get("weathernext_checkpoint_kind")
+        if actual is None:
+            raise ValueError(
+                "WeatherNext token manifest has no checkpoint provenance; regenerate "
+                "tokens with prepare-weathernext-tokens"
+            )
+        if actual != expected:
+            raise ValueError(
+                f"Expected {expected} WeatherNext tokens, but manifest records {actual}"
+            )
 
     def contains(self, storm_id: str, init_time_ns: int) -> bool:
         return (str(storm_id), int(init_time_ns)) in self.files

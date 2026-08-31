@@ -251,6 +251,39 @@ pip install -e '.[weathernext]'
 
 공개 운영 WN2 가중치는 HRES 초기조건에 맞춰져 있으므로 실제 추론에는 HRES 사용을 우선 권장합니다. ERA5는 과거 실험, 전처리 검증과 보정 ablation에 사용할 수 있습니다.
 
+### 공식 checkpoint 다운로드부터 후단 학습까지
+
+공식 checkpoint는 저장소의 `download/` 경로로 내려받을 수 있습니다. 대형 weight는
+Git에서 제외되고, 모델 구조·release·공식 출처를 기록한 metadata가 함께 생성됩니다.
+
+```bash
+download-weathernext-checkpoint --model weathernext2
+
+prepare-weathernext-tokens \
+  --initial-state data/hres_history.nc \
+  --checkpoint 'download/WeatherNext2_<2025_model1.npz' \
+  --model-variant WeatherNext2 \
+  --storm-id WP012026 \
+  --init-time 2026-08-01T00:00:00 \
+  --storm-lat 22.5 \
+  --storm-lon 132.0 \
+  --output-dir data/official_pretrained_tokens
+
+train-weathernext-transformer \
+  --integrated data/integrated.parquet \
+  --distribution data/spatial_distribution.csv \
+  --weathernext-token-dir data/official_pretrained_tokens \
+  --gpt-state-dir data/gpt_states \
+  --require-checkpoint-kind official_pretrained \
+  --output checkpoints/official_pretrained_fusion.pt
+```
+
+fine-tuned weight를 사용할 때는 checkpoint만
+`download/weather-me-fine_tune_weight.npz`로 바꾸고 학습 검증 옵션을
+`--require-checkpoint-kind fine_tuned`으로 설정합니다. token manifest와 최종 `.pt`에
+checkpoint provenance가 보존되므로 실제 적용 여부를 확인할 수 있습니다. 전체
+명령과 파일 구조는 [`download/README.md`](download/README.md)를 참고하십시오.
+
 ### 보정 전후 평가
 
 동일한 초기 시각과 태풍에 대해 다음 세 실험을 분리하십시오.

@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 import xarray as xr
 
@@ -43,8 +44,22 @@ def test_weathernext_output_reaches_masked_transformer(tmp_path):
     tokens = WeatherNextForecastTokenizer(token_config)(forecast, init_time)
     assert tokens.values.shape == (4 * 3 * 4, 4)
     assert tokens.feature_mask.shape == tokens.values.shape
-    save_forecast_tokens(tokens, tmp_path, storm_id="TEST", init_time=init_time)
+    save_forecast_tokens(
+        tokens,
+        tmp_path,
+        storm_id="TEST",
+        init_time=init_time,
+        provenance={
+            "weathernext_backend": "pretrained",
+            "weathernext_model_variant": "WeatherNext2",
+            "weathernext_checkpoint_kind": "official_pretrained",
+        },
+    )
     store = DirectoryForecastTokenStore(tmp_path)
+    assert store.provenance()["weathernext_checkpoint_kind"] == "official_pretrained"
+    store.require_checkpoint_kind("official_pretrained")
+    with pytest.raises(ValueError, match="manifest records official_pretrained"):
+        store.require_checkpoint_kind("fine_tuned")
 
     distribution = SpatialDistributionLookup.from_frame(pd.DataFrame({
         "calendar_month": [1, 1], "lat_bin": [1, 1], "lon_bin": [0, 1],

@@ -38,6 +38,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--input-mask-probability", type=float, default=0.15)
     parser.add_argument("--distribution-weight", type=float, default=1.0)
     parser.add_argument("--track-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--require-checkpoint-kind",
+        choices=["official_pretrained", "fine_tuned", "pretrained_unknown"],
+        help="Fail unless the WeatherNext token manifest records this checkpoint kind",
+    )
     parser.add_argument("--output", default="checkpoints/weathernext_transformer.pt")
     args = parser.parse_args(argv)
 
@@ -58,6 +63,9 @@ def main(argv: list[str] | None = None) -> int:
     store = DirectoryForecastTokenStore(args.weathernext_token_dir)
     if not store.files:
         raise ValueError("WeatherNext token manifest is empty")
+    if args.require_checkpoint_kind:
+        store.require_checkpoint_kind(args.require_checkpoint_kind)
+    weathernext_provenance = store.provenance()
     first_key = next(iter(store.files))
     forecast_input_dim = store.load(*first_key).values.shape[1]
     gpt_state_store = None
@@ -76,14 +84,14 @@ def main(argv: list[str] | None = None) -> int:
         decoder_layers=args.decoder_layers,
         input_mask_probability=args.input_mask_probability,
     )
-    dataset_kwargs = dict(
-        base_dataset=base,
-        distribution=lookup,
-        model_config=model_config,
-        forecast_store=store,
-        max_forecast_tokens=args.max_forecast_tokens,
-        forecast_input_dim=forecast_input_dim,
-    )
+    dataset_kwargs = {
+        "base_dataset": base,
+        "distribution": lookup,
+        "model_config": model_config,
+        "forecast_store": store,
+        "max_forecast_tokens": args.max_forecast_tokens,
+        "forecast_input_dim": forecast_input_dim,
+    }
     if gpt_state_store is not None:
         from .gpt_state import WeatherNextGPTDualTargetDataset
 
@@ -111,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
         "model": model.state_dict(),
         "model_config": model_config.__dict__,
         "transformer_config": transformer_config.__dict__,
+        "weathernext_provenance": weathernext_provenance,
     }, output)
     return 0
 

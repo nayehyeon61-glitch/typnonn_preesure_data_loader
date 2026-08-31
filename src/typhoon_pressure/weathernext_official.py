@@ -293,6 +293,17 @@ def _validate_checkpoint_metadata(
     return metadata
 
 
+def _checkpoint_kind(metadata: dict[str, Any]) -> str:
+    recorded = metadata.get("checkpoint_kind")
+    if recorded:
+        return str(recorded)
+    if metadata.get("fine_tune_steps") is not None:
+        return "fine_tuned"
+    if metadata.get("official_pretrained") is True:
+        return "official_pretrained"
+    return "pretrained_unknown"
+
+
 def _import_official_modules() -> dict[str, Any]:
     try:
         import haiku as hk
@@ -316,7 +327,7 @@ def _import_official_modules() -> dict[str, Any]:
 
 
 class OfficialWeatherNextRunner:
-    """Load fine-tuned WN2 parameters once and run inference only."""
+    """Load official or fine-tuned WN2 parameters once and run inference only."""
 
     inference_only = True
 
@@ -341,6 +352,7 @@ class OfficialWeatherNextRunner:
         self.checkpoint_metadata = _validate_checkpoint_metadata(
             self.checkpoint_path, self.spec, release
         )
+        self.checkpoint_kind = _checkpoint_kind(self.checkpoint_metadata)
         modules = _import_official_modules()
         self._jax = modules["jax"]
         self._rollout_module = modules["rollout"]
@@ -433,5 +445,6 @@ class OfficialWeatherNextRunner:
                 "weathernext_inference_only": True,
                 "weathernext_model_variant": self.spec.name,
                 "weathernext_checkpoint_path": str(self.checkpoint_path),
+                "weathernext_checkpoint_kind": self.checkpoint_kind,
             }
         )
