@@ -19,6 +19,6 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e '.[test,gpt]'
+          pip install -e '.[test,gpt,flow]'
       - name: Run tests
         run: pytest -q
