@@ -50,6 +50,7 @@ class SmallModelConfig:
 class DualLossConfig:
     distribution_weight: float = 1.0
     local_track_weight: float = 1.0
+    survival_weight: float = 1.0
     track_scale_km: float = 500.0
 
 
