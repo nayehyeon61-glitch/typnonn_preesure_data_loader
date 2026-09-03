@@ -7,10 +7,8 @@ from torch.nn import functional as F
 from .config import DualLossConfig
 
 
-def soft_distribution_cross_entropy(
-    logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
-) -> torch.Tensor:
-    """Cross entropy against an empirical IBTrACS probability distribution."""
+def soft_distribution_cross_entropy(logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Cross entropy for Q_t(x), conditional on a distribution target being available."""
     target = target / target.sum(dim=-1, keepdim=True).clamp_min(1e-12)
     per_lead = -(target * F.log_softmax(logits, dim=-1)).sum(dim=-1)
     denominator = mask.sum()
@@ -19,13 +17,17 @@ def soft_distribution_cross_entropy(
     return (per_lead * mask).sum() / denominator
 
 
-def east_asia_track_error(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-    mask: torch.Tensor,
-    scale_km: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Local tangent-plane MSE and unscaled RMSE, both dateline safe."""
+def survival_binary_cross_entropy(survival_probability, target, mask):
+    """Masked BCE on the monotone S_t curve; unknown/censored labels are excluded."""
+    probability = survival_probability.clamp(1e-6, 1.0 - 1e-6)
+    per_lead = F.binary_cross_entropy(probability, target, reduction="none")
+    denominator = mask.sum()
+    if denominator.item() == 0:
+        return survival_probability.sum() * 0.0
+    return (per_lead * mask).sum() / denominator
+
+
+def east_asia_track_error(prediction, target, mask, scale_km):
     km_per_degree = 111.32
     lat_error_km = (prediction[..., 0] - target[..., 0]) * km_per_degree
     lon_delta = torch.remainder(prediction[..., 1] - target[..., 1] + 180.0, 360.0) - 180.0
@@ -40,7 +42,7 @@ def east_asia_track_error(
 
 
 class DualObjectiveLoss(nn.Module):
-    """L = lambda_dist * CE + lambda_track * normalized local MSE."""
+    """Backward-compatible name for distribution + track + survival objective."""
 
     def __init__(self, config: DualLossConfig = DualLossConfig()):
         super().__init__()
@@ -53,14 +55,17 @@ class DualObjectiveLoss(nn.Module):
         track_loss, track_rmse_km = east_asia_track_error(
             outputs["track_latlon"], batch["track_target"], batch["track_mask"], self.config.track_scale_km
         )
-        total = (
-            self.config.distribution_weight * distribution_loss
-            + self.config.local_track_weight * track_loss
-        )
-        return {
-            "loss": total,
-            "distribution_ce": distribution_loss,
-            "local_track_mse_normalized": track_loss,
-            "local_track_rmse_km": track_rmse_km,
-        }
-
+        if "survival_probability" in outputs and "survival_target" in batch:
+            survival_loss = survival_binary_cross_entropy(
+                outputs["survival_probability"], batch["survival_target"], batch["survival_mask"]
+            )
+        else:
+            # Keep old checkpoints/tests usable while migration completes.
+            survival_loss = distribution_loss * 0.0
+        total = (self.config.distribution_weight * distribution_loss
+                 + self.config.local_track_weight * track_loss
+                 + self.config.survival_weight * survival_loss)
+        return {"loss": total, "distribution_ce": distribution_loss,
+                "survival_bce": survival_loss,
+                "local_track_mse_normalized": track_loss,
+                "local_track_rmse_km": track_rmse_km}
