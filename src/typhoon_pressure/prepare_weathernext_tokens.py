@@ -7,12 +7,10 @@ import argparse
 import pandas as pd
 import xarray as xr
 
+from .forecast_provenance import run_and_save_forecast_tokens
 from .initial_condition import InitialConditionBuilder, StormObservation
 from .small_version.config import WeatherNextTokenConfig
-from .small_version.weathernext_bridge import (
-    WeatherNextForecastTokenizer,
-    run_and_save_weathernext_tokens,
-)
+from .small_version.weathernext_bridge import WeatherNextForecastTokenizer
 from .weathernext_adapter import WeatherNextRequest, make_weathernext_request
 from .weathernext_backends import WeatherNextBackendConfig, build_weathernext_runner
 
@@ -61,10 +59,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.backend == "pretrained" and not args.model_variant:
         parser.error("--model-variant is required for the pretrained backend")
     horizon_hours = args.horizon_hours or (
-        720 if args.backend == "flow_matching" else 360
+        360 if args.backend == "flow_matching" else 360
     )
-    if args.backend == "flow_matching" and (horizon_hours <= 0 or horizon_hours % 720):
-        parser.error("monthly flow_matching horizon must be a positive 720-hour multiple")
+    if horizon_hours <= 0:
+        parser.error("--horizon-hours must be positive")
 
     storm = StormObservation(
         storm_id=args.storm_id,
@@ -77,13 +75,15 @@ def main(argv: list[str] | None = None) -> int:
     with _open_dataset(args.initial_state) as atmospheric_state:
         config = WeatherNextBackendConfig(
             backend=args.backend,
-            model_id=args.model_id or args.model_variant or "monthly-flow-matching",
+            model_id=args.model_id or args.model_variant or "flow-matching",
             model_variant=args.model_variant,
-            release=args.release if args.backend == "pretrained" else "monthly-v1",
+            release=args.release if args.backend == "pretrained" else "climate-diffusion",
             checkpoint=args.checkpoint,
         )
         runner = build_weathernext_runner(config)
         if args.backend == "flow_matching":
+            # The Flow checkpoint itself owns forecast_step_hours. The runner rejects
+            # incompatible horizons (e.g. 360h with a legacy 720h monthly checkpoint).
             time_name = next(
                 (name for name in ("time", "valid_time", "datetime") if name in atmospheric_state.coords),
                 None,
@@ -105,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
                 },
                 horizon_hours=horizon_hours,
                 initialization_metadata={
-                    "requested_mode": "flow_monthly_history",
+                    "requested_mode": "flow_fixed_step_history",
                     "correction_applied": False,
                 },
             )
@@ -126,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
                 target_lon_tokens=args.lon_tokens,
             )
         )
-        path = run_and_save_weathernext_tokens(runner, request, tokenizer, args.output_dir)
+        path = run_and_save_forecast_tokens(runner, request, tokenizer, args.output_dir)
     print(path)
     return 0
 
