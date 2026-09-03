@@ -3,6 +3,7 @@ import pandas as pd
 import xarray as xr
 
 from typhoon_pressure.forecast_provenance import (
+    backend_provenance,
     cache_forecast_provenance,
     run_and_save_forecast_tokens,
 )
@@ -48,6 +49,17 @@ class FakeFlowRunner:
         )
 
 
+class FakeWeatherNextRunner:
+    def provenance(self):
+        return {
+            "weathernext_backend": "pretrained",
+            "weathernext_model_id": "WeatherNext2_<2025_model1",
+            "weathernext_model_variant": "WeatherNext2",
+            "weathernext_release": "v0.3.0",
+            "weathernext_checkpoint": "/not/a/local/file.npz",
+        }
+
+
 def test_flow_token_manifest_preserves_generic_provenance_and_360h_endpoint(tmp_path):
     init = pd.Timestamp("2025-01-01")
     initial = xr.Dataset(
@@ -88,3 +100,23 @@ def test_flow_token_manifest_preserves_generic_provenance_and_360h_endpoint(tmp_
     assert provenance["forecast_step_hours"] == "360"
     assert provenance["forecast_horizon_hours"] == "360"
     assert provenance["forecast_schema_format"] == "climate_diffusion.fixed_step_state.v1"
+
+
+def test_weathernext_metadata_maps_into_same_generic_schema():
+    forecast = xr.Dataset(
+        {"msl": (("time", "lat", "lon"), np.ones((1, 1, 1), dtype=np.float32))},
+        coords={"time": [pd.Timestamp("2025-01-16")], "lat": [20.0], "lon": [130.0]},
+        attrs={
+            "weathernext_checkpoint_kind": "official_pretrained",
+            "weathernext_checkpoint_format": "weathernext.weathernext2.fgn.CheckPoint",
+            "weathernext_checkpoint_sha256": "wn-sha",
+        },
+    )
+    provenance = backend_provenance(FakeWeatherNextRunner(), forecast)
+    assert provenance["forecast_backend"] == "pretrained"
+    assert provenance["forecast_checkpoint"] == "/not/a/local/file.npz"
+    assert provenance["forecast_checkpoint_kind"] == "official_pretrained"
+    assert provenance["forecast_checkpoint_sha256"] == "wn-sha"
+    assert provenance["forecast_checkpoint_format"] == "weathernext.weathernext2.fgn.CheckPoint"
+    assert provenance["forecast_release"] == "v0.3.0"
+    assert provenance["forecast_step_hours"] == "6"
