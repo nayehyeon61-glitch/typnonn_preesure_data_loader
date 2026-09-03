@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pandas as pd
@@ -33,16 +32,49 @@ def _string(value) -> str:
 
 
 def backend_provenance(runner, forecast) -> dict[str, str]:
+    """Normalize Flow and WeatherNext identities into one forecast_* schema."""
     values: dict[str, object] = {}
     provider = getattr(runner, "provenance", None)
     if callable(provider):
         values.update(provider())
-    values.update({key: value for key, value in forecast.attrs.items() if key.startswith("forecast_")})
+    # Forecast attrs may contain richer checkpoint metadata than the wrapper.
+    values.update(dict(forecast.attrs))
 
-    checkpoint = values.get("forecast_checkpoint")
-    if not values.get("forecast_checkpoint_sha256") and checkpoint:
-        values["forecast_checkpoint_sha256"] = file_fingerprint(str(checkpoint))
-    return {name: _string(values.get(name)) for name in FORECAST_PROVENANCE_COLUMNS}
+    aliases = {
+        "forecast_backend": ("forecast_backend", "weathernext_backend"),
+        "forecast_checkpoint": ("forecast_checkpoint", "weathernext_checkpoint"),
+        "forecast_checkpoint_kind": (
+            "forecast_checkpoint_kind", "weathernext_checkpoint_kind", "checkpoint_kind"
+        ),
+        "forecast_checkpoint_sha256": (
+            "forecast_checkpoint_sha256", "weathernext_checkpoint_sha256", "checkpoint_sha256"
+        ),
+        "forecast_checkpoint_format": (
+            "forecast_checkpoint_format", "weathernext_checkpoint_format", "checkpoint_format"
+        ),
+        "forecast_release": ("forecast_release", "weathernext_release"),
+        "forecast_step_hours": ("forecast_step_hours", "weathernext_step_hours"),
+        "forecast_schema_format": ("forecast_schema_format",),
+        "forecast_horizon_hours": ("forecast_horizon_hours",),
+    }
+    generic: dict[str, object] = {}
+    for name, candidates in aliases.items():
+        generic[name] = next(
+            (values[key] for key in candidates if values.get(key) not in (None, "")),
+            "",
+        )
+
+    # Official WeatherNext operates on 6-hour increments if the runner did not
+    # explicitly expose its step. This is model cadence, not requested horizon.
+    if not generic["forecast_step_hours"] and generic["forecast_backend"] in {
+        "pretrained", "trainable", "api"
+    }:
+        generic["forecast_step_hours"] = 6
+
+    checkpoint = generic.get("forecast_checkpoint")
+    if not generic.get("forecast_checkpoint_sha256") and checkpoint:
+        generic["forecast_checkpoint_sha256"] = file_fingerprint(str(checkpoint))
+    return {name: _string(generic.get(name)) for name in FORECAST_PROVENANCE_COLUMNS}
 
 
 def _legacy_provenance(runner, tokenizer, request, generic: dict[str, str]) -> dict[str, str]:
