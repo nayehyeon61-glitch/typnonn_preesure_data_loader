@@ -19,12 +19,16 @@ gpt = ["openai>=2.0", "pydantic>=2.0"]
 weathernext = [
   "weathernext @ git+https://github.com/google-deepmind/weathernext.git@v0.3.0",
 ]
+flow = [
+  "climate-diffusion @ git+https://github.com/nayehyeon61-glitch/climate_diffusion.git@30f0fff9e28fb30572a048cdb0776c0a2b3c8bcd",
+]
 
 [project.scripts]
 build-typhoon-pressure-data = "typhoon_pressure.cli:main"
 build-typhoon-distribution-targets = "typhoon_pressure.small_version.prepare_distribution:main"
 train-small-typhoon-model = "typhoon_pressure.small_version.train:main"
 prepare-weathernext-pipeline = "typhoon_pressure.prepare_weathernext_pipeline:main"
+prepare-weathernext-tokens = "typhoon_pressure.prepare_weathernext_tokens:main"
 tokenize-weathernext-output = "typhoon_pressure.small_version.tokenize_weathernext:main"
 train-weathernext-transformer = "typhoon_pressure.small_version.train_transformer:main"
 build-gpt-state-cache = "typhoon_pressure.small_version.build_gpt_state_cache:main"
