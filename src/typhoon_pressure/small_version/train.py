@@ -31,7 +31,7 @@ DIAGNOSTIC_OUTPUTS = (
     "gpt_forecast_token_gate_mean", "gpt_forecast_channel_gate_mean",
     "distribution_process_std_mean", "distribution_initial_std_mean",
     "distribution_sample_spread_deg", "weathernext_endpoint_fraction",
-    "weathernext_endpoint_residual_deg",
+    "weathernext_endpoint_residual_deg", "endpoint_contract_match_fraction",
 )
 
 
@@ -44,6 +44,7 @@ def forward_batch(model, tensors):
             extra_state.update(
                 weathernext_endpoint_latlon=tensors["weathernext_endpoint_latlon"],
                 weathernext_endpoint_mask=tensors["weathernext_endpoint_mask"],
+                weathernext_endpoint_lead_hours=tensors.get("weathernext_endpoint_lead_hours"),
             )
         return model(
             tensors["history"], tensors["history_mask"], tensors["forecast_values"],
