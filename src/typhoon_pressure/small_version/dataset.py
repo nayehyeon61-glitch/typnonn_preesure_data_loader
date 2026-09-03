@@ -21,19 +21,12 @@ class SpatialDistributionLookup:
     n_lon: int
 
     @classmethod
-    def from_frame(
-        cls,
-        frame: pd.DataFrame,
-        *,
-        lat_bin_deg: float = 5.0,
-        lon_bin_deg: float = 5.0,
-    ) -> "SpatialDistributionLookup":
+    def from_frame(cls, frame: pd.DataFrame, *, lat_bin_deg: float = 5.0, lon_bin_deg: float = 5.0):
         required = {"calendar_month", "lat_bin", "lon_bin", "probability"}
         missing = required.difference(frame.columns)
         if missing:
             raise ValueError(f"Distribution table is missing columns: {sorted(missing)}")
-        n_lat = round(180.0 / lat_bin_deg)
-        n_lon = round(360.0 / lon_bin_deg)
+        n_lat, n_lon = round(180.0 / lat_bin_deg), round(360.0 / lon_bin_deg)
         dense = np.zeros((12, n_lat * n_lon), dtype=np.float32)
         available = np.zeros(12, dtype=bool)
         for row in frame.itertuples(index=False):
@@ -47,78 +40,80 @@ class SpatialDistributionLookup:
         return cls(dense, available, n_lat, n_lon)
 
     @classmethod
-    def from_csv(cls, path: str, **kwargs) -> "SpatialDistributionLookup":
+    def from_csv(cls, path: str, **kwargs):
         return cls.from_frame(pd.read_csv(path), **kwargs)
 
-    def targets(self, init_time_ns: int, lead_days: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray]:
+    def targets(self, init_time_ns: int, lead_days: tuple[int, ...]):
         init_time = pd.Timestamp(init_time_ns, unit="ns")
         months = np.asarray([(init_time + pd.Timedelta(days=day)).month - 1 for day in lead_days])
         return self.probabilities[months].copy(), self.available_months[months].astype(np.float32)
 
 
 class DualTargetDataset(Dataset):
-    """Add global distribution and East-Asia local-track targets to the base dataset."""
+    """Global Q_t targets, East-Asia tracks, and censor-aware long-range survival."""
 
-    def __init__(
-        self,
-        base_dataset: Dataset,
-        distribution: SpatialDistributionLookup,
-        model_config: SmallModelConfig,
-        bounds: EastAsiaBounds = EastAsiaBounds(),
-    ):
+    def __init__(self, base_dataset: Dataset, distribution: SpatialDistributionLookup,
+                 model_config: SmallModelConfig, bounds: EastAsiaBounds = EastAsiaBounds()):
         if distribution.n_lat != model_config.n_lat or distribution.n_lon != model_config.n_lon:
             raise ValueError("Distribution grid and model grid do not match")
-        self.base = base_dataset
-        self.distribution = distribution
-        self.config = model_config
-        self.bounds = bounds
+        self.base, self.distribution, self.config, self.bounds = base_dataset, distribution, model_config, bounds
+        frame = getattr(base_dataset, "frame", None)
+        self._storm_last_time_ns: dict[str, int] = {}
+        if isinstance(frame, pd.DataFrame) and {"storm_id", "time"}.issubset(frame.columns):
+            work = frame[["storm_id", "time"]].copy()
+            work["time"] = pd.to_datetime(work["time"], errors="coerce")
+            work = work.dropna(subset=["time"])
+            for storm_id, group in work.groupby("storm_id"):
+                self._storm_last_time_ns[str(storm_id)] = int(group["time"].max().value)
 
     def __len__(self):
         return len(self.base)
+
+    def _survival_targets(self, storm_id: str, init_time_ns: int):
+        """Return S_t labels and an observability mask.
+
+        A known last IBTrACS timestamp makes later configured leads valid negative
+        survival labels. If the base dataset does not expose its source frame, the
+        labels are masked rather than guessing storm death from missing data.
+        """
+        last_time_ns = self._storm_last_time_ns.get(str(storm_id))
+        leads = np.asarray(self.config.lead_days, dtype=np.int64)
+        if last_time_ns is None:
+            return np.zeros(len(leads), dtype=np.float32), np.zeros(len(leads), dtype=np.float32)
+        lead_time_ns = int(init_time_ns) + leads * 24 * 60 * 60 * 1_000_000_000
+        alive = (lead_time_ns <= last_time_ns).astype(np.float32)
+        return alive, np.ones_like(alive, dtype=np.float32)
 
     def __getitem__(self, index):
         sample = self.base[index]
         if sample["target"].shape[0] != self.config.local_track_steps:
             raise ValueError("Base dataset horizon must equal local_track_steps")
-        distribution_target, distribution_mask = self.distribution.targets(
-            sample["init_time_ns"], self.config.lead_days
-        )
+        distribution_target, distribution_mask = self.distribution.targets(sample["init_time_ns"], self.config.lead_days)
+        survival_target, survival_mask = self._survival_targets(sample["storm_id"], sample["init_time_ns"])
         track = sample["target"][:, :2]
         valid = sample["target_mask"][:, :2].all(dim=-1)
         lon360 = torch.remainder(track[:, 1], 360.0)
-        in_domain = (
-            (track[:, 0] >= self.bounds.lat_min) & (track[:, 0] <= self.bounds.lat_max)
-            & (lon360 >= self.bounds.lon_min) & (lon360 <= self.bounds.lon_max)
-        )
+        in_domain = ((track[:, 0] >= self.bounds.lat_min) & (track[:, 0] <= self.bounds.lat_max)
+                     & (lon360 >= self.bounds.lon_min) & (lon360 <= self.bounds.lon_max))
         return {
-            "history": sample["history"],
-            "history_mask": sample["history_mask"],
+            "history": sample["history"], "history_mask": sample["history_mask"],
             "distribution_target": torch.from_numpy(distribution_target),
             "distribution_mask": torch.from_numpy(distribution_mask),
-            "track_target": track,
-            "track_mask": (valid & in_domain).to(torch.float32),
-            "storm_id": sample["storm_id"],
-            "init_time_ns": sample["init_time_ns"],
+            "survival_target": torch.from_numpy(survival_target),
+            "survival_mask": torch.from_numpy(survival_mask),
+            "track_target": track, "track_mask": (valid & in_domain).to(torch.float32),
+            "storm_id": sample["storm_id"], "init_time_ns": sample["init_time_ns"],
         }
 
 
 class WeatherNextDualTargetDataset(DualTargetDataset):
-    """Dual targets plus a fixed-size, fully masked WeatherNext token sequence."""
+    """Probabilistic targets plus a fixed-size, fully masked forecast token sequence."""
 
-    def __init__(
-        self,
-        base_dataset: Dataset,
-        distribution: SpatialDistributionLookup,
-        model_config: SmallModelConfig,
-        forecast_store: DirectoryForecastTokenStore,
-        *,
-        max_forecast_tokens: int,
-        forecast_input_dim: int,
-        bounds: EastAsiaBounds = EastAsiaBounds(),
-    ):
+    def __init__(self, base_dataset, distribution, model_config, forecast_store, *,
+                 max_forecast_tokens: int, forecast_input_dim: int,
+                 bounds: EastAsiaBounds = EastAsiaBounds()):
         super().__init__(base_dataset, distribution, model_config, bounds)
-        self.forecast_store = forecast_store
-        self.max_forecast_tokens = max_forecast_tokens
+        self.forecast_store, self.max_forecast_tokens = forecast_store, max_forecast_tokens
         self.forecast_input_dim = forecast_input_dim
         self.indices = []
         for index in range(len(self.base)):
@@ -130,27 +125,19 @@ class WeatherNextDualTargetDataset(DualTargetDataset):
         return len(self.indices)
 
     def __getitem__(self, index):
-        base_index = self.indices[index]
-        sample = super().__getitem__(base_index)
+        sample = super().__getitem__(self.indices[index])
         tokens = self.forecast_store.load(sample["storm_id"], sample["init_time_ns"])
         if tokens.values.shape[1] != self.forecast_input_dim:
-            raise ValueError(
-                f"WeatherNext feature count {tokens.values.shape[1]} does not match "
-                f"forecast_input_dim={self.forecast_input_dim}"
-            )
+            raise ValueError(f"WeatherNext feature count {tokens.values.shape[1]} does not match forecast_input_dim={self.forecast_input_dim}")
         count = min(len(tokens.values), self.max_forecast_tokens)
         values = np.zeros((self.max_forecast_tokens, self.forecast_input_dim), dtype=np.float32)
         feature_mask = np.zeros_like(values)
         token_mask = np.zeros(self.max_forecast_tokens, dtype=np.float32)
         positions = np.zeros((self.max_forecast_tokens, 6), dtype=np.float32)
-        values[:count] = tokens.values[:count]
-        feature_mask[:count] = tokens.feature_mask[:count]
-        token_mask[:count] = tokens.token_mask[:count]
-        positions[:count] = tokens.positions[:count]
-        sample.update({
-            "forecast_values": torch.from_numpy(values),
-            "forecast_feature_mask": torch.from_numpy(feature_mask),
-            "forecast_token_mask": torch.from_numpy(token_mask),
-            "forecast_positions": torch.from_numpy(positions),
-        })
+        values[:count], feature_mask[:count] = tokens.values[:count], tokens.feature_mask[:count]
+        token_mask[:count], positions[:count] = tokens.token_mask[:count], tokens.positions[:count]
+        sample.update({"forecast_values": torch.from_numpy(values),
+                       "forecast_feature_mask": torch.from_numpy(feature_mask),
+                       "forecast_token_mask": torch.from_numpy(token_mask),
+                       "forecast_positions": torch.from_numpy(positions)})
         return sample
