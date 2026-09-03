@@ -284,50 +284,146 @@ fine-tuned weight를 사용할 때는 checkpoint만
 checkpoint provenance가 보존되므로 실제 적용 여부를 확인할 수 있습니다. 전체
 명령과 파일 구조는 [`download/README.md`](download/README.md)를 참고하십시오.
 
-### Frozen 월별 Flow Matching 통합
+### 실행 가이드: GPT-conditioned Flow Double-Loss
 
-`climate_diffusion`에서 사전학습한 한 달 예측 checkpoint도 forecast backend로
-사용할 수 있습니다. Flow 모델은 `eval() + requires_grad_(False) + inference_mode()`로
-고정되며 후단 optimizer에는 포함되지 않습니다.
+아래 절은 이미 학습된 월별 Flow Matching checkpoint를 고정하고, forecast token과
+GPT synoptic state를 사전 생성한 뒤 distribution CE와 local-track MSE를 함께
+학습하는 전체 실행 순서입니다. Flow 모델은
+`eval() + requires_grad_(False) + inference_mode()`로 유지되며 후단 optimizer에는
+포함되지 않습니다. GPT API도 학습 loop 안에서 호출하지 않습니다.
+
+#### 0. 설치 및 API 설정
 
 ```bash
-pip install -e '.[flow]'
+pip install -e '.[io,small,gpt,flow]'
+export OPENAI_API_KEY="YOUR_OPENAI_API_KEY"
+```
 
+다음 파일이 준비되어 있어야 합니다.
+
+```text
+data/integrated_typhoon_pressure.parquet
+data/distribution/spatial_distribution.csv
+data/era5_hres_history.zarr
+../climate_diffusion/download/flow-matching/monthly-spatial-025/climate-flow-spatial-025.pt
+```
+
+통합 데이터가 없다면 먼저 생성합니다.
+
+```bash
+build-typhoon-pressure-data \
+  --ibtracs data/IBTrACS.ALL.v04r01.csv \
+  --era5 data/era5/msl/*.nc \
+  --basin WP --agency TOKYO \
+  --radius-km 2500 --max-highs 3 \
+  --output data/integrated_typhoon_pressure.parquet
+```
+
+분포 target이 없다면 생성합니다.
+
+```bash
+build-typhoon-distribution-targets \
+  --ibtracs data/IBTrACS.ALL.v04r01.csv \
+  --basins WP \
+  --start-year 1980 --end-year 2025 \
+  --lat-bin-deg 5 --lon-bin-deg 5 \
+  --output-dir data/distribution
+```
+
+#### 1. 전체 Flow forecast token cache
+
+```bash
 prepare-weathernext-tokens \
   --backend flow_matching \
   --initial-state data/era5_hres_history.zarr \
-  --checkpoint ../climate_diffusion/download/flow-matching/monthly-v1/climate-flow-monthly-v1.pt \
-  --storm-id WP012026 --init-time 2026-08-01T00:00:00 \
-  --storm-lat 22.5 --storm-lon 132.0 \
-  --horizon-hours 720 --max-lead-hours 720 \
+  --checkpoint ../climate_diffusion/download/flow-matching/monthly-spatial-025/climate-flow-spatial-025.pt \
+  --jobs data/integrated_typhoon_pressure.parquet \
+  --horizon-hours 720 \
+  --max-lead-hours 720 \
+  --max-time-steps 10 \
+  --lat-tokens 6 --lon-tokens 12 \
   --output-dir data/flow_matching_tokens
+```
 
-# 전체 integrated dataset을 batch/resume
-prepare-weathernext-tokens \
-  --backend flow_matching \
-  --initial-state data/era5_hres_history.zarr \
-  --checkpoint ../climate_diffusion/download/flow-matching/monthly-v1/climate-flow-monthly-v1.pt \
-  --jobs data/integrated.parquet \
-  --horizon-hours 720 --max-lead-hours 720 \
-  --output-dir data/flow_matching_tokens
+`--jobs`는 integrated table의 모든 고유 `(storm_id, init_time)`을 순회합니다. 모델과
+입력 dataset은 한 번만 열고, 기존 manifest entry는 기본적으로 건너뛰므로 중단 후
+같은 명령을 실행하면 이어서 처리됩니다. 완료 시 manifest coverage, token
+shape/mask, 실제 파일과 checkpoint provenance를 검사합니다. 다른 checkpoint가
+기록된 directory에는 resume하지 않습니다.
 
+월별 Flow checkpoint는 한 step이 720시간이므로 현재 계약에서는
+`--horizon-hours 720 --max-lead-hours 720`을 함께 사용합니다. 각 job의 초기시각보다
+앞선 월별 history가 checkpoint의 `history_months` 이상 존재해야 합니다.
+
+#### 2. GPT synoptic-state cache
+
+첫 전체 생성에서는 실패를 masked state로 숨기지 않도록 strict 설정을 사용합니다.
+
+```bash
+build-gpt-state-cache \
+  --integrated data/integrated_typhoon_pressure.parquet \
+  --output-dir data/gpt_states \
+  --model gpt-5.6 \
+  --history 8 \
+  --track-steps 20 \
+  --max-highs 3 \
+  --on-error raise \
+  --overwrite
+```
+
+모든 state가 생성된 뒤 재실행할 때는 `--overwrite`를 제거하면 기존 identity를
+건너뜁니다. API 실패를 허용하는 탐색 실행에서만 `--on-error mask`를 사용합니다.
+
+#### 3. GPT-conditioned double-loss 학습
+
+```bash
 train-weathernext-transformer \
-  --integrated data/integrated.parquet \
-  --distribution data/spatial_distribution.csv \
+  --integrated data/integrated_typhoon_pressure.parquet \
+  --distribution data/distribution/spatial_distribution.csv \
   --weathernext-token-dir data/flow_matching_tokens \
   --gpt-state-dir data/gpt_states \
   --require-checkpoint-kind flow_matching \
-  --output checkpoints/flow_matching_fusion.pt
+  --history 8 \
+  --track-steps 20 \
+  --max-highs 3 \
+  --max-forecast-tokens 720 \
+  --model-dim 128 \
+  --num-heads 8 \
+  --num-layers 4 \
+  --decoder-layers 2 \
+  --input-mask-probability 0.15 \
+  --distribution-weight 1.0 \
+  --track-weight 1.0 \
+  --epochs 100 \
+  --batch-size 8 \
+  --output checkpoints/gpt_flow_double_loss.pt
 ```
 
-`--jobs`는 integrated table을 순회하여 모든 고유 `(storm_id, init_time)`을 생성합니다.
-모델과 입력 dataset은 한 번만 열고, 기존 manifest entry는 기본적으로 건너뜁니다.
-완료 시 manifest coverage, token shape/mask, 파일 존재 여부와 checkpoint provenance를
-검증합니다. 다른 checkpoint가 기록된 directory에는 resume하지 않습니다.
+학습 목적함수는 다음과 같습니다.
 
-이 경우에도 GPT conditioning과 GRU/Transformer, distribution cross-entropy +
-track MSE double loss는 동일하게 학습됩니다. token manifest와 최종 checkpoint에는
-Flow checkpoint 경로·SHA-256·format이 `forecast_provenance`로 보존됩니다.
+```text
+L_total = distribution_weight * DistributionCrossEntropy
+        + track_weight * NormalizedLocalTrackMSE
+```
+
+학습되는 모듈은 GPT-state FiLM/router, history GRU, forecast Transformer, fusion과 두
+prediction head입니다. 결과 checkpoint에는 Flow checkpoint의 경로, SHA-256,
+format이 `forecast_provenance`로 저장됩니다.
+
+#### 4. 정상 산출물
+
+```text
+data/flow_matching_tokens/
+├── manifest.csv
+└── <storm_id>__<init_time_ns>.npz
+
+data/gpt_states/
+├── manifest.csv
+└── <storm_id>__<init_time_ns>.npz
+
+checkpoints/
+└── gpt_flow_double_loss.pt
+```
 
 월별 Flow는 720시간 state를 생성하므로 WeatherNext2의 0–360시간 성능을 직접
 공정 비교하는 모델은 아닙니다. 15일 대체 실험에는 별도의 6시간 간격 trajectory
@@ -480,7 +576,7 @@ export OPENAI_API_KEY=...
 build-gpt-state-cache \
   --integrated data/integrated_typhoon_pressure.parquet \
   --output-dir data/gpt_states \
-  --on-error mask
+  --on-error raise
 
 train-weathernext-transformer \
   --integrated data/integrated_typhoon_pressure.parquet \
