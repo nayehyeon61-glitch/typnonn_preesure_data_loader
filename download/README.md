@@ -70,6 +70,10 @@ prepare-weathernext-tokens \
 이 명령은 checkpoint를 읽기 전용으로 로드하고, 0–15일 rollout을 실행한 뒤
 Transformer token과 provenance를 `manifest.csv`에 저장합니다.
 
+전체 integrated table에 대한 cache는 같은 명령에서 개별 storm 인자 대신
+`--jobs data/integrated.parquet`을 사용합니다. 모든 `(storm_id, init_time)` coverage를
+검사하며 중단 후 재실행하면 완성된 identity는 자동으로 resume합니다.
+
 ## 4. 후단 모델 학습
 
 ```bash

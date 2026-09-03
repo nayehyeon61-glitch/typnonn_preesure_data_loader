@@ -302,6 +302,15 @@ prepare-weathernext-tokens \
   --horizon-hours 720 --max-lead-hours 720 \
   --output-dir data/flow_matching_tokens
 
+# 전체 integrated dataset을 batch/resume
+prepare-weathernext-tokens \
+  --backend flow_matching \
+  --initial-state data/era5_hres_history.zarr \
+  --checkpoint ../climate_diffusion/download/flow-matching/monthly-v1/climate-flow-monthly-v1.pt \
+  --jobs data/integrated.parquet \
+  --horizon-hours 720 --max-lead-hours 720 \
+  --output-dir data/flow_matching_tokens
+
 train-weathernext-transformer \
   --integrated data/integrated.parquet \
   --distribution data/spatial_distribution.csv \
@@ -310,6 +319,11 @@ train-weathernext-transformer \
   --require-checkpoint-kind flow_matching \
   --output checkpoints/flow_matching_fusion.pt
 ```
+
+`--jobs`는 integrated table을 순회하여 모든 고유 `(storm_id, init_time)`을 생성합니다.
+모델과 입력 dataset은 한 번만 열고, 기존 manifest entry는 기본적으로 건너뜁니다.
+완료 시 manifest coverage, token shape/mask, 파일 존재 여부와 checkpoint provenance를
+검증합니다. 다른 checkpoint가 기록된 directory에는 resume하지 않습니다.
 
 이 경우에도 GPT conditioning과 GRU/Transformer, distribution cross-entropy +
 track MSE double loss는 동일하게 학습됩니다. token manifest와 최종 checkpoint에는
