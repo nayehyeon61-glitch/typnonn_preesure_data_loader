@@ -20,7 +20,7 @@ weathernext = [
   "weathernext @ git+https://github.com/google-deepmind/weathernext.git@v0.3.0",
 ]
 flow = [
-  "climate-diffusion @ git+https://github.com/nayehyeon61-glitch/climate_diffusion.git@2e248b0e78161800dafa802544a2bcd8f668e2c4",
+  "climate-diffusion @ git+https://github.com/nayehyeon61-glitch/climate_diffusion.git@ab95c7373b841841d92f5f8c8d3a7481eed03f87",
 ]
 
 [project.scripts]
