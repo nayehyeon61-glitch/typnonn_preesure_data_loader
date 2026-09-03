@@ -161,7 +161,15 @@ class DualTargetDataset(Dataset):
 
 
 class WeatherNextDualTargetDataset(DualTargetDataset):
-    """Dual targets plus a fixed-size, fully masked WeatherNext token sequence."""
+    """Dual targets plus a fixed-size, fully masked forecast token sequence.
+
+    When an endpoint lead is required, it is an *exact semantic contract*: the
+    endpoint must correspond to the distribution start time (for example
+    360 h for day 15). A later endpoint such as a 720 h monthly Flow forecast
+    must never be silently reused as the day-15 P15 anchor.
+    """
+
+    ENDPOINT_LEAD_TOLERANCE_HOURS = 1e-3
 
     def __init__(
         self,
@@ -186,7 +194,10 @@ class WeatherNextDualTargetDataset(DualTargetDataset):
             if self.forecast_store.contains(sample["storm_id"], sample["init_time_ns"]):
                 if require_endpoint_lead_hours is not None:
                     tokens = self.forecast_store.load(sample["storm_id"], sample["init_time_ns"])
-                    if not tokens.endpoint_mask or tokens.endpoint_lead_hours + 1e-6 < require_endpoint_lead_hours:
+                    lead_matches = abs(
+                        float(tokens.endpoint_lead_hours) - float(require_endpoint_lead_hours)
+                    ) <= self.ENDPOINT_LEAD_TOLERANCE_HOURS
+                    if not tokens.endpoint_mask or not lead_matches:
                         continue
                 self.indices.append(index)
 
@@ -202,7 +213,7 @@ class WeatherNextDualTargetDataset(DualTargetDataset):
         tokens = self.forecast_store.load(sample["storm_id"], sample["init_time_ns"])
         if tokens.values.shape[1] != self.forecast_input_dim:
             raise ValueError(
-                f"WeatherNext feature count {tokens.values.shape[1]} does not match "
+                f"Forecast feature count {tokens.values.shape[1]} does not match "
                 f"forecast_input_dim={self.forecast_input_dim}"
             )
         count = min(len(tokens.values), self.max_forecast_tokens)
