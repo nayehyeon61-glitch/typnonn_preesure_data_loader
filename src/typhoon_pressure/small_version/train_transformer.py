@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 
 from typhoon_pressure.dataset import TyphoonPressureDataset
 from typhoon_pressure.evaluation.storm_split import StormSplitSubset, load_storm_split
+from typhoon_pressure.forecast_provenance import cache_forecast_provenance
 
 from .config import (
     DistributionSamplingConfig,
@@ -25,7 +26,7 @@ from .weathernext_bridge import DirectoryForecastTokenStore
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Train WeatherNext/GPT fusion with adaptive day 15-30 trajectory sampling"
+        description="Train frozen-forecast/GPT fusion with adaptive day 15-30 trajectory sampling"
     )
     parser.add_argument("--integrated", required=True)
     parser.add_argument("--distribution", help="Optional legacy grid metadata")
@@ -39,6 +40,11 @@ def main(argv: list[str] | None = None) -> int:
         "--require-valid-gpt-states",
         action="store_true",
         help="Fail when any cached GPT record is masked due to an API failure",
+    )
+    parser.add_argument(
+        "--require-forecast-backend",
+        choices=["flow_matching", "pretrained"],
+        help="Fail unless generic token provenance records this forecast backend",
     )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -87,7 +93,22 @@ def main(argv: list[str] | None = None) -> int:
         )
     store = DirectoryForecastTokenStore(args.weathernext_token_dir)
     if not store.files:
-        raise ValueError("WeatherNext token manifest is empty")
+        raise ValueError("Forecast token manifest is empty")
+    forecast_provenance = cache_forecast_provenance(store)
+    required_endpoint_hours = model_config.distribution_start_day * 24
+    if args.require_forecast_backend:
+        actual_backend = forecast_provenance.get("forecast_backend")
+        if actual_backend != args.require_forecast_backend:
+            raise ValueError(
+                f"Expected forecast_backend={args.require_forecast_backend}, got {actual_backend!r}"
+            )
+    if forecast_provenance.get("forecast_horizon_hours"):
+        actual_horizon = int(float(forecast_provenance["forecast_horizon_hours"]))
+        if actual_horizon != required_endpoint_hours:
+            raise ValueError(
+                f"Training requires an exact {required_endpoint_hours}h forecast horizon for P15; "
+                f"token provenance records {actual_horizon}h"
+            )
     first_key = next(iter(store.files))
     forecast_input_dim = store.load(*first_key).values.shape[1]
     gpt_state_store = None
@@ -129,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         forecast_store=store,
         max_forecast_tokens=args.max_forecast_tokens,
         forecast_input_dim=forecast_input_dim,
-        require_endpoint_lead_hours=model_config.distribution_start_day * 24,
+        require_endpoint_lead_hours=required_endpoint_hours,
     )
     if gpt_state_store is not None:
         from .gpt_state import WeatherNextGPTDualTargetDataset
@@ -140,7 +161,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         dataset = WeatherNextDualTargetDataset(**dataset_kwargs)
     if len(dataset) == 0:
-        raise ValueError("No base samples match the WeatherNext token manifest")
+        raise ValueError(
+            f"No base samples match the forecast token manifest with exact {required_endpoint_hours}h endpoints"
+        )
     split_manifest = load_storm_split(args.split_manifest)
     train_dataset = StormSplitSubset(dataset, split_manifest, "train")
     validation_dataset = StormSplitSubset(dataset, split_manifest, "validation")
@@ -149,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
     generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, generator=generator)
     validation_loader = DataLoader(validation_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-    print({"train_windows": len(train_dataset), "validation_windows": len(validation_dataset), "train_storms": len(train_dataset.storm_ids), "validation_storms": len(validation_dataset.storm_ids)})
+    print({"train_windows": len(train_dataset), "validation_windows": len(validation_dataset), "train_storms": len(train_dataset.storm_ids), "validation_storms": len(validation_dataset.storm_ids), "forecast_provenance": forecast_provenance})
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = WeatherNextFusionTransformer(
         model_config, transformer_config, sampling_config=sampling_config
@@ -176,7 +199,8 @@ def main(argv: list[str] | None = None) -> int:
                 "model": model.state_dict(), "model_config": model_config.__dict__,
                 "transformer_config": transformer_config.__dict__, "sampling_config": sampling_config.__dict__,
                 "loss_config": loss_config.__dict__,
-                "data_config": {"history": args.history, "track_steps": args.track_steps, "max_highs": args.max_highs, "max_forecast_tokens": args.max_forecast_tokens},
+                "forecast_provenance": forecast_provenance,
+                "data_config": {"history": args.history, "track_steps": args.track_steps, "max_highs": args.max_highs, "max_forecast_tokens": args.max_forecast_tokens, "required_endpoint_hours": required_endpoint_hours},
                 "split_manifest": str(Path(args.split_manifest).resolve()),
                 "train_storm_ids": sorted(train_dataset.storm_ids),
                 "validation_storm_ids": sorted(validation_dataset.storm_ids),
