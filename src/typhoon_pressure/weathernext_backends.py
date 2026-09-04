@@ -23,13 +23,7 @@ class TrainableRolloutModel(RolloutModel, Protocol):
 
 
 class WeatherNextAPIClient(Protocol):
-    def forecast(
-        self,
-        initial_state: xr.Dataset,
-        horizon_hours: int,
-        *,
-        model_id: str,
-    ) -> xr.Dataset: ...
+    def forecast(self, initial_state: xr.Dataset, horizon_hours: int, *, model_id: str) -> xr.Dataset: ...
 
 
 @dataclass(frozen=True)
@@ -55,13 +49,8 @@ class WeatherNextBackendConfig:
             raise ValueError("WeatherNext model_id cannot be empty")
         if not self.release.strip():
             raise ValueError("Pin a forecast release for reproducibility")
-        if self.backend_type in {
-            WeatherNextBackend.PRETRAINED,
-            WeatherNextBackend.FLOW_MATCHING,
-        } and not self.checkpoint:
-            raise ValueError(
-                f"{self.backend_type.value} backend requires a checkpoint identifier or path"
-            )
+        if self.backend_type in {WeatherNextBackend.PRETRAINED, WeatherNextBackend.FLOW_MATCHING} and not self.checkpoint:
+            raise ValueError(f"{self.backend_type.value} backend requires a checkpoint identifier or path")
         if self.backend_type is WeatherNextBackend.API and not self.api_provider:
             raise ValueError("api backend requires api_provider provenance")
 
@@ -107,13 +96,29 @@ class PretrainedWeatherNextRunner(_RunnerMetadata):
         return self.model.rollout(initial_state, horizon_hours)
 
 
+def _discover_flow_parameters(model: Any):
+    """Return the underlying torch parameters when a Flow implementation exposes them."""
+    module = getattr(getattr(model, "forecaster", None), "model", None)
+    if module is None and hasattr(model, "parameters"):
+        module = model
+    parameters = getattr(module, "parameters", None)
+    return None if not callable(parameters) else tuple(parameters())
+
+
 @dataclass
 class FrozenFlowMatchingRunner:
-    """Inference-only bridge to a climate_diffusion Flow Matching checkpoint."""
+    """Inference-only bridge with an explicit no-gradient boundary."""
 
     config: WeatherNextBackendConfig
     model: RolloutModel
     inference_only: bool = field(default=True, init=False)
+
+    def __post_init__(self) -> None:
+        if getattr(self.model, "inference_only", True) is not True:
+            raise RuntimeError("Flow backend must declare inference_only=True")
+        parameters = _discover_flow_parameters(self.model)
+        if parameters is not None and any(parameter.requires_grad for parameter in parameters):
+            raise RuntimeError("Flow backend parameters must be frozen before downstream use")
 
     def provenance(self) -> dict[str, str | int | bool | None]:
         model_provenance = getattr(self.model, "provenance", None)
@@ -125,6 +130,7 @@ class FrozenFlowMatchingRunner:
                 "forecast_checkpoint_kind": "flow_matching",
                 "forecast_release": self.config.release,
                 "inference_only": True,
+                "parameters_frozen": True,
             }
         )
         return values
@@ -139,9 +145,7 @@ class APIWeatherNextRunner(_RunnerMetadata):
     client: WeatherNextAPIClient
 
     def rollout(self, initial_state: xr.Dataset, horizon_hours: int) -> xr.Dataset:
-        return self.client.forecast(
-            initial_state, horizon_hours, model_id=self.config.model_id
-        )
+        return self.client.forecast(initial_state, horizon_hours, model_id=self.config.model_id)
 
 
 def build_weathernext_runner(
@@ -162,7 +166,6 @@ def build_weathernext_runner(
     if backend is WeatherNextBackend.PRETRAINED:
         if pretrained_model is None:
             from .weathernext_official import OfficialWeatherNextRunner
-
             pretrained_model = OfficialWeatherNextRunner(
                 model_name=config.model_variant or config.model_id,
                 checkpoint_path=config.checkpoint,
