@@ -454,3 +454,169 @@ evaluate-weathernext-transformer \
 - ERA5 고기압은 관측 label이 아니라 MSLP에서 계산한 파생 feature입니다.
 - train/validation/test는 row가 아니라 `storm_id` 단위로 분리해야 같은 태풍이 양쪽에 포함되는 leakage를 막을 수 있습니다.
 - 경도 180° 경계는 wrapped longitude 차이로 처리합니다.
+
+## 7. RunPod downstream 실행 순서
+
+이 저장소는 RunPod 전체 시스템에서 **P15 downstream**을 담당합니다. Flow 자체의
+spatial/fixed-step 학습은 `climate_diffusion`에서 먼저 끝내고, 여기서는 frozen
+forecast → token → GPT state/router → Transformer → Q_t/survival을 학습합니다.
+
+### 7.1 설치
+
+두 통합 PR이 merge되기 전에는 아래 integration branch를 사용합니다. merge 후에는
+`git checkout main`으로 바꿉니다.
+
+```bash
+cd /workspace/repos
+
+git clone https://github.com/nayehyeon61-glitch/climate_diffusion.git
+cd climate_diffusion
+git checkout integration/production-consolidation
+pip install -e '.[io,test]'
+pytest -q
+
+cd /workspace/repos
+git clone https://github.com/nayehyeon61-glitch/typnonn_preesure_data_loader.git
+cd typnonn_preesure_data_loader
+git checkout integration/p15-360h-survival-contract
+
+# 현재 [flow] extra는 오래된 climate_diffusion commit을 pin한다.
+# local production-candidate climate_diffusion을 유지하기 위해 [flow]는 사용하지 않는다.
+pip install -e '.[io,test,small,gpt]'
+pytest -q
+```
+
+### 7.2 데이터 통합과 storm split
+
+```bash
+build-typhoon-pressure-data \
+  --ibtracs /workspace/data/ibtracs/IBTrACS.ALL.v04r01.csv \
+  --era5 '/workspace/data/era5/*.nc' \
+  --basin WP --agency TOKYO \
+  --radius-km 2500 --max-highs 3 \
+  --output /workspace/data/integrated_typhoon_pressure.parquet
+
+build-storm-split \
+  --integrated /workspace/data/integrated_typhoon_pressure.parquet \
+  --output /workspace/data/storm_split.csv
+
+build-typhoon-distribution-targets \
+  --ibtracs /workspace/data/ibtracs/IBTrACS.ALL.v04r01.csv \
+  --basins WP \
+  --output-dir /workspace/data/distribution
+```
+
+동일한 `storm_id`가 서로 다른 split에 들어가면 안 됩니다.
+
+### 7.3 exact-360h frozen Flow token 생성
+
+`climate_diffusion`에서 학습한 fixed-step `best.pt`를 사용합니다. P15의 계약은
+**forecast horizon=360h**입니다. 24h step checkpoint라면 15 step, 6h checkpoint라면
+60 step을 rollout합니다. legacy monthly 720h checkpoint를 넣고 360h를 요청하면
+실패해야 정상입니다.
+
+```bash
+prepare-weathernext-tokens \
+  --backend flow_matching \
+  --checkpoint /workspace/checkpoints/flow_matching/fixed_step/production/best.pt \
+  --initial-state /workspace/data/era5/era5_history.zarr \
+  --storm-id WP_TEST_001 \
+  --init-time 2025-08-01T00:00:00 \
+  --storm-lat 22.5 --storm-lon 132.0 \
+  --horizon-hours 360 --max-lead-hours 360 \
+  --output-dir /workspace/cache/flow_360h
+```
+
+실제 학습 전에는 모든 `(storm_id, init_time)`에 대해 같은 provenance의 token을
+생성해야 합니다. 서로 다른 checkpoint/backend/horizon token은 같은 cache directory에
+섞지 않습니다.
+
+### 7.4 GPT state cache
+
+```bash
+export OPENAI_API_KEY='...'
+
+build-gpt-state-cache \
+  --integrated /workspace/data/integrated_typhoon_pressure.parquet \
+  --output-dir /workspace/cache/gpt_states \
+  --on-error mask
+```
+
+GPT는 optimizer loop 안에서 호출하지 않습니다. `--on-error mask`에서는 실패 record를
+0-state/mask로 저장하고 Router는 identity fallback을 사용합니다. 논문 본 실험에서 API
+실패 record를 허용하지 않으려면 학습 시 `--require-valid-gpt-states`를 켭니다.
+
+### 7.5 downstream smoke
+
+```bash
+train-weathernext-transformer \
+  --integrated /workspace/data/integrated_typhoon_pressure.parquet \
+  --distribution /workspace/data/distribution/spatial_distribution.csv \
+  --weathernext-token-dir /workspace/cache/flow_360h \
+  --gpt-state-dir /workspace/cache/gpt_states \
+  --split-manifest /workspace/data/storm_split.csv \
+  --require-forecast-backend flow_matching \
+  --epochs 1 --batch-size 2 \
+  --distribution-samples 8 \
+  --distribution-weight 1.0 \
+  --track-weight 1.0 \
+  --survival-weight 1.0 \
+  --output /workspace/checkpoints/gpt_double_loss/smoke.pt
+```
+
+trainer는 token provenance의 horizon이 `distribution_start_day*24 = 360h`와 다르면
+실패합니다. 또한 train/validation storm 집합이 겹치면 실패합니다.
+
+### 7.6 full GPT-DoubleLoss / Q_t / survival training
+
+```bash
+train-weathernext-transformer \
+  --integrated /workspace/data/integrated_typhoon_pressure.parquet \
+  --distribution /workspace/data/distribution/spatial_distribution.csv \
+  --weathernext-token-dir /workspace/cache/flow_360h \
+  --gpt-state-dir /workspace/cache/gpt_states \
+  --split-manifest /workspace/data/storm_split.csv \
+  --require-forecast-backend flow_matching \
+  --require-valid-gpt-states \
+  --epochs 50 --batch-size 8 \
+  --history 8 --track-steps 20 \
+  --model-dim 128 --num-heads 8 --num-layers 4 --decoder-layers 2 \
+  --distribution-samples 32 \
+  --distribution-weight 1.0 \
+  --track-weight 1.0 \
+  --survival-weight 1.0 \
+  --output /workspace/checkpoints/gpt_double_loss/gpt_double_loss.pt
+```
+
+현재 probabilistic interpretation은 `P_t(x)=S_t Q_t(x)`입니다. `S_t`는 survival,
+`Q_t(x)`는 storm이 존재한다는 조건부 위치분포이며 sampling에서 죽은 storm의
+`cell_index`는 `-1`입니다.
+
+### 7.7 실행 전 체크리스트
+
+```text
+[ ] climate_diffusion tests green
+[ ] typnonn tests green
+[ ] fixed-step checkpoint provenance 확인
+[ ] forecast_horizon_hours == 360
+[ ] Flow parameters frozen / downstream optimizer에 없음
+[ ] token cache에 backend/checkpoint/horizon 혼합 없음
+[ ] storm split leakage 없음
+[ ] GPT cache coverage 확인
+[ ] smoke 1 epoch 성공 후 full training 시작
+```
+
+전체 순서는 다음과 같습니다.
+
+```text
+fixed-step Flow best.pt
+  → exact 360h frozen rollout
+  → forecast token cache
+  → storm-level split
+  → GPT state cache
+  → GPTForecastRouter + Fusion Transformer
+  → P15
+  → adaptive Q_t + survival S_t
+  → DoubleLoss
+  → held-out storm evaluation
+```
