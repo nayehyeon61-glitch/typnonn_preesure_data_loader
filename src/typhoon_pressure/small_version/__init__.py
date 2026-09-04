@@ -12,6 +12,13 @@ from .dataset import DualTargetDataset, SpatialDistributionLookup, WeatherNextDu
 from .distribution_sampling import AdaptiveDistributionSampler
 from .losses import DualObjectiveLoss
 from .model import GPTForecastRouter, SmallDualScaleModel, WeatherNextFusionTransformer
+from .probabilistic import (
+    ProbabilisticSamples,
+    conditional_distribution,
+    hazard_logits_to_survival,
+    joint_distribution,
+    sample_survival_locations,
+)
 from .weathernext_bridge import (
     DirectoryForecastTokenStore,
     ForecastTokens,
@@ -30,6 +37,7 @@ __all__ = [
     "EastAsiaBounds",
     "ForecastTokens",
     "GPTForecastRouter",
+    "ProbabilisticSamples",
     "SmallDualScaleModel",
     "SmallModelConfig",
     "SpatialDistributionLookup",
@@ -38,6 +46,10 @@ __all__ = [
     "WeatherNextForecastTokenizer",
     "WeatherNextFusionTransformer",
     "WeatherNextTokenConfig",
+    "conditional_distribution",
+    "hazard_logits_to_survival",
+    "joint_distribution",
     "run_and_save_weathernext_tokens",
+    "sample_survival_locations",
     "save_forecast_tokens",
 ]
